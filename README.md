@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # 🚕 Mumbai Smart Cab Fare Prediction & Route Optimization System
 
 An advanced Machine Learning and Geospatial Routing system that predicts cab fares across Mumbai, finds shortest driving routes via **OSRM (Open Source Routing Machine)** on **OpenStreetMap**, and compares estimated fares across **Ola**, **Uber**, **Rapido**, and **RTO Kaali-Peeli meter rates**.
@@ -66,3 +67,7 @@ streamlit run mumbai_app.py
 2. **Why Mumbai Data:** Replaced NYC grid/USD system with Mumbai RTO regulations (₹28 base), monsoon multipliers, and suburban arterial road networks.
 3. **Shortest Route Logic:** OSRM Multi-Level Dijkstra (MLD) / Contraction Hierarchies (CH) vs. conceptual Dijkstra & A* algorithms.
 4. **Platform Comparison:** Rule-based calculation from `platform_fares.json` allowing offline/free platform comparisons without live web scraping risks.
+=======
+# fare-price-pridiction
+building a project of fair price pridiction using stramlit and others
+>>>>>>> 27839d28874e23ed9315fd3d30c64f241c852f54
