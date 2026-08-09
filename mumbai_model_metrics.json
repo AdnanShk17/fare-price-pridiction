@@ -1,0 +1,9 @@
+{
+    "model_name": "RandomForestRegressor",
+    "dataset_records": 5000,
+    "mae": 9.68,
+    "rmse": 19.28,
+    "r2_score": 0.9954,
+    "target_currency": "INR (\u20b9)",
+    "city": "Mumbai, India"
+}
