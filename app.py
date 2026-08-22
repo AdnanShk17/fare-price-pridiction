@@ -6,6 +6,9 @@ import pydeck as pdk
 from datetime import datetime
 import os
 import json
+import folium
+from streamlit_folium import st_folium
+from geopy.geocoders import Nominatim
 
 # Import custom routing engine
 import route_engine
@@ -120,7 +123,34 @@ def load_model_metrics():
 model = load_model()
 platform_config = load_platform_config()
 metrics_info = load_model_metrics()
+# ==========================
+# Map Click Session State
+# ==========================
+if "pickup" not in st.session_state:
+    st.session_state.pickup = None
 
+if "drop" not in st.session_state:
+    st.session_state.drop = None
+if "pickup_address" not in st.session_state:
+    st.session_state.pickup_address = ""
+
+if "drop_address" not in st.session_state:
+    st.session_state.drop_address = ""
+
+geolocator = Nominatim(user_agent="mumbai_fare_app")
+def search_location(query):
+    try:
+        location = geolocator.geocode(query + ", Mumbai, Maharashtra")
+        if location:
+            return (
+                location.latitude,
+                location.longitude,
+                location.address
+            )
+    except:
+        pass
+
+    return None
 # --------------------------------------------------
 # Mumbai Popular Locations
 # --------------------------------------------------
@@ -158,22 +188,83 @@ with tab_app:
     # --------------------------------------------------
     st.sidebar.header("📍 Trip Parameters")
     
-    input_mode = st.sidebar.radio("Location Mode", ["Popular Mumbai Hubs", "Custom Coordinates"])
+    input_mode = st.sidebar.radio(
+    "Location Mode",
+    ["Popular Mumbai Hubs", "Click on Map", "Custom Coordinates"]
+    )
     
+    # ==========================================
+    # LOCATION INPUT
+    # ==========================================
+
     if input_mode == "Popular Mumbai Hubs":
-        pickup_name = st.sidebar.selectbox("Pickup Location", list(MUMBAI_LOCATIONS.keys()), index=0)
-        dropoff_options = [loc for loc in MUMBAI_LOCATIONS.keys() if loc != pickup_name]
-        dropoff_name = st.sidebar.selectbox("Dropoff Location", dropoff_options, index=4)
-        
+
+        pickup_name = st.sidebar.selectbox(
+            "Pickup Location",
+            list(MUMBAI_LOCATIONS.keys()),
+            index=0
+        )
+
+        dropoff_options = [
+            loc for loc in MUMBAI_LOCATIONS.keys()
+            if loc != pickup_name
+        ]
+
+        dropoff_name = st.sidebar.selectbox(
+            "Dropoff Location",
+            dropoff_options,
+            index=4
+        )
+
         p_lat, p_lon = MUMBAI_LOCATIONS[pickup_name]
         d_lat, d_lon = MUMBAI_LOCATIONS[dropoff_name]
+
+
+    elif input_mode == "Custom Coordinates":
+
+        p_lat = st.sidebar.number_input(
+            "Pickup Latitude",
+            value=19.0760,
+            format="%.4f"
+        )
+
+        p_lon = st.sidebar.number_input(
+            "Pickup Longitude",
+            value=72.8777,
+            format="%.4f"
+        )
+
+        d_lat = st.sidebar.number_input(
+            "Dropoff Latitude",
+            value=19.0896,
+            format="%.4f"
+        )
+
+        d_lon = st.sidebar.number_input(
+            "Dropoff Longitude",
+            value=72.8656,
+            format="%.4f"
+        )
+
+        pickup_name = "Custom Pickup"
+        dropoff_name = "Custom Drop"
+
+
     else:
-        p_lat = st.sidebar.number_input("Pickup Latitude", value=19.0760, format="%.4f")
-        p_lon = st.sidebar.number_input("Pickup Longitude", value=72.8777, format="%.4f")
-        d_lat = st.sidebar.number_input("Dropoff Latitude", value=19.0896, format="%.4f")
-        d_lon = st.sidebar.number_input("Dropoff Longitude", value=72.8656, format="%.4f")
-        pickup_name = f"Custom ({p_lat:.3f}, {p_lon:.3f})"
-        dropoff_name = f"Custom ({d_lat:.3f}, {d_lon:.3f})"
+        # Click on Map mode
+
+        pickup_name = "Map Pickup"
+        dropoff_name = "Map Drop"
+
+        if st.session_state.pickup:
+            p_lat, p_lon = st.session_state.pickup
+        else:
+            p_lat, p_lon = 19.0760, 72.8777
+
+        if st.session_state.drop:
+            d_lat, d_lon = st.session_state.drop
+        else:
+            d_lat, d_lon = 19.0896, 72.8656
 
     st.sidebar.divider()
     st.sidebar.header("🚗 Trip Options")
@@ -204,7 +295,117 @@ with tab_app:
         "CartoDB Dark Matter (Dark)": "https://basemaps.cartocdn.com/rastertiles/dark_all/{z}/{x}/{y}.png",
         "Esri World Street Map": "https://server.arcgisonline.com/ArcGIS/rest/services/World_Street_Map/MapServer/tile/{z}/{y}/{x}"
     }
+    
+    # ==========================================
+    # CLICKABLE MAP
+    # ==========================================
 
+    if input_mode == "Click on Map":
+
+        st.subheader("🗺️ Select Your Trip")
+        colA, colB = st.columns(2)
+
+        with colA:
+            pickup_search = st.text_input(
+                "🔍 Search Pickup",
+                placeholder="e.g. Bandra Station"
+        )
+
+        with colB:
+            drop_search = st.text_input(
+                "🔍 Search Drop",
+                placeholder="e.g. Mumbai Airport T2"
+        )
+        st.caption("1st click = Pickup • 2nd click = Drop • 3rd click = Start a new trip")
+
+        m = folium.Map(
+            location=[19.0760, 72.8777],
+            zoom_start=11
+        )
+        # ==========================================
+        # SEARCH PICKUP & DROP
+        # ==========================================
+
+        if pickup_search:
+            result = search_location(pickup_search)
+            if result:
+                lat, lon, address = result
+                st.session_state.pickup = (lat, lon)
+                st.session_state.pickup_address = address
+                p_lat, p_lon = lat, lon
+
+        if drop_search:
+            result = search_location(drop_search)
+            if result:
+                lat, lon, address = result
+                st.session_state.drop = (lat, lon)
+                st.session_state.drop_address = address
+                d_lat, d_lon = lat, lon
+
+        # Pickup marker
+        if st.session_state.pickup:
+            folium.Marker(
+                st.session_state.pickup,
+                tooltip="Pickup",
+                icon=folium.Icon(color="green")
+            ).add_to(m)
+
+        # Drop marker
+        if st.session_state.drop:
+            folium.Marker(
+                st.session_state.drop,
+                tooltip="Drop",
+                icon=folium.Icon(color="red")
+            ).add_to(m)
+
+        map_data = st_folium(
+            m,
+            width="100%",
+            height=500,
+            key="pickup_map"
+        )
+
+        # 👇 KEEP THIS INSIDE THE BLOCK
+        if map_data and map_data.get("last_clicked"):
+
+            lat = map_data["last_clicked"]["lat"]
+            lon = map_data["last_clicked"]["lng"]
+
+            location = geolocator.reverse((lat, lon), language="en")
+            address = location.address if location else "Unknown Location"
+
+            if st.session_state.pickup is None:
+                st.session_state.pickup = (lat, lon)
+                st.session_state.pickup_address = address
+
+            elif st.session_state.drop is None:
+                st.session_state.drop = (lat, lon)
+                st.session_state.drop_address = address
+
+            else:
+                st.session_state.pickup = (lat, lon)
+                st.session_state.pickup_address = address
+                st.session_state.drop = None
+                st.session_state.drop_address = ""
+
+            st.rerun()
+
+        if st.session_state.pickup:
+            p_lat, p_lon = st.session_state.pickup
+            st.success("🟢 Pickup")
+            st.write(st.session_state.pickup_address)
+
+        if st.session_state.drop:
+            d_lat, d_lon = st.session_state.drop
+            st.error("🔴 Drop")
+            st.write(st.session_state.drop_address)
+
+        if st.button("Clear Selection"):
+            st.session_state.pickup = None
+            st.session_state.drop = None
+            st.session_state.pickup_address = ""
+            st.session_state.drop_address = ""
+            st.rerun()
     # --------------------------------------------------
     # Fetch Route from OSRM
     # --------------------------------------------------
@@ -221,68 +422,60 @@ with tab_app:
     col_map, col_info = st.columns([3, 2])
 
     with col_map:
-        st.subheader("🗺️ Mumbai Shortest Driving Route")
-        st.caption(f"Routing Engine: **{route_res['provider']}** | Algorithm: **{route_res['algorithm']}**")
-        
-        # Prepare PyDeck data
-        pickup_df = pd.DataFrame([{"lat": p_lat, "lon": p_lon, "label": f"Pickup: {pickup_name}", "color": [34, 197, 94]}])
-        dropoff_df = pd.DataFrame([{"lat": d_lat, "lon": d_lon, "label": f"Dropoff: {dropoff_name}", "color": [239, 68, 68]}])
-        
-        # Format line path for PyDeck
-        # path_coords is list of [lat, lon], PyDeck PathLayer requires [[lon, lat], ...]
-        pydeck_path = [[pt[1], pt[0]] for pt in path_coords]
-        path_data = [{"path": pydeck_path}]
+        st.subheader("🗺️ Mumbai Interactive Route Map")
+        st.caption(f"Routing: {route_res['provider']} | {route_res['algorithm']}")
 
-        path_layer = pdk.Layer(
-            "PathLayer",
-            data=path_data,
-            get_path="path",
-            get_color=[56, 189, 248],
-            width_scale=20,
-            width_min_pixels=5
-        )
-
-        pickup_layer = pdk.Layer(
-            "ScatterplotLayer",
-            data=pickup_df,
-            get_position="[lon, lat]",
-            get_color="color",
-            get_radius=250,
-            pickable=True
-        )
-
-        dropoff_layer = pdk.Layer(
-            "ScatterplotLayer",
-            data=dropoff_df,
-            get_position="[lon, lat]",
-            get_color="color",
-            get_radius=250,
-            pickable=True
-        )
-
-        # Center map view
+        # Center map
         mid_lat = (p_lat + d_lat) / 2
         mid_lon = (p_lon + d_lon) / 2
-        zoom_lvl = 12 if route_dist_km < 10 else (10 if route_dist_km < 25 else 9)
 
-        view_state = pdk.ViewState(
-            latitude=mid_lat,
-            longitude=mid_lon,
-            zoom=zoom_lvl,
-            pitch=30
+        route_map = folium.Map(
+            location=[mid_lat, mid_lon],
+            zoom_start=12,
+            tiles="OpenStreetMap"
         )
 
-        tile_layer = pdk.Layer(
-            "BitmapLayer",
-            data=None,
-            tile_url=tile_urls[map_tile_choice]
-        )
+        # Pickup marker
+        folium.Marker(
+            [p_lat, p_lon],
+            popup=st.session_state.pickup_address,
+            tooltip="🟢 Pickup",
+            icon=folium.Icon(color="green", icon="play")
+        ).add_to(route_map)
 
-        st.pydeck_chart(pdk.Deck(
-            layers=[tile_layer, path_layer, pickup_layer, dropoff_layer],
-            initial_view_state=view_state,
-            tooltip={"text": "{label}"}
-        ))
+        # Drop marker
+        folium.Marker(
+            [d_lat, d_lon],
+            popup=st.session_state.drop_address,
+            tooltip="🔴 Drop",
+            icon=folium.Icon(color="red", icon="stop")
+        ).add_to(route_map)
+
+        # Blue OSRM route
+        folium.PolyLine(
+            locations=path_coords,
+            color="#2563EB",
+            weight=6,
+            opacity=0.9
+        ).add_to(route_map)
+
+        st_folium(
+            route_map,
+            width="100%",
+            height=500,
+            key="route_display_map"
+        )
+        st.markdown("### 📍 Selected Locations")
+
+        c1, c2 = st.columns(2)
+
+        with c1:
+            st.success("🟢 Pickup")
+            st.write(st.session_state.pickup_address)
+
+        with c2:
+            st.error("🔴 Drop")
+            st.write(st.session_state.drop_address)
 
     with col_info:
         st.subheader("🎯 Trip Summary & ML Fare")
