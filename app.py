@@ -136,6 +136,22 @@ if "pickup_address" not in st.session_state:
 
 if "drop_address" not in st.session_state:
     st.session_state.drop_address = ""
+# ==========================================
+# INTERMEDIATE STOPS SESSION STATE
+# ==========================================
+
+if "stops" not in st.session_state:
+    st.session_state.stops = []
+
+if "stop_addresses" not in st.session_state:
+    st.session_state.stop_addresses = []
+if "adding_stop" not in st.session_state:
+    st.session_state.adding_stop = False
+if "map_center" not in st.session_state:
+    st.session_state.map_center = [19.0760, 72.8777]
+
+if "map_zoom" not in st.session_state:
+    st.session_state.map_zoom = 11
 
 geolocator = Nominatim(user_agent="mumbai_fare_app")
 def search_location(query):
@@ -303,6 +319,37 @@ with tab_app:
     if input_mode == "Click on Map":
 
         st.subheader("🗺️ Select Your Trip")
+        # ==========================================
+        # ADD / REMOVE STOPS
+        # ==========================================
+
+        col_add, col_remove = st.columns(2)
+
+        with col_add:
+            if st.button("➕ Add Stop", use_container_width=True):
+                if len(st.session_state.stops) < 3:
+                    st.session_state.stops.append(None)
+                    st.session_state.stop_addresses.append("")
+                    st.session_state.adding_stop = True    
+        with col_remove:
+            if st.button("🗑 Clear Stops"):
+                st.session_state.stops = []
+                st.session_state.stop_addresses = []
+
+        # ==========================================
+        # DISPLAY STOPS
+        # ==========================================
+        if len(st.session_state.stops) > 0:
+
+            st.markdown("### 🚏 Intermediate Stops")
+
+            for i in range(len(st.session_state.stops)):
+                if st.session_state.stops[i] is not None:
+                    st.success(f"🟠 Stop {i+1}")
+                    st.write(st.session_state.stop_addresses[i])
+                else:
+                    st.warning(f"🟠 Stop {i+1}: Click on the map below to select")
+
         colA, colB = st.columns(2)
 
         with colA:
@@ -318,9 +365,18 @@ with tab_app:
         )
         st.caption("1st click = Pickup • 2nd click = Drop • 3rd click = Start a new trip")
 
+        tile_attr = {
+            "OpenStreetMap (Default)": "© OpenStreetMap contributors",
+            "CartoDB Positron (Light)": "© OpenStreetMap contributors © CARTO",
+            "CartoDB Dark Matter (Dark)": "© OpenStreetMap contributors © CARTO",
+            "Esri World Street Map": "Tiles © Esri"
+        }
+
         m = folium.Map(
-            location=[19.0760, 72.8777],
-            zoom_start=11
+            location=st.session_state.map_center,
+            zoom_start=st.session_state.map_zoom,
+            tiles=tile_urls[map_tile_choice],
+            attr=tile_attr[map_tile_choice]
         )
         # ==========================================
         # SEARCH PICKUP & DROP
@@ -349,6 +405,14 @@ with tab_app:
                 tooltip="Pickup",
                 icon=folium.Icon(color="green")
             ).add_to(m)
+        # Stop markers
+        for i, stop in enumerate(st.session_state.stops):
+            if stop is not None:
+                folium.Marker(
+                    stop,
+                    tooltip=f"Stop {i+1}",
+                    icon=folium.Icon(color="orange", icon="flag")
+                ).add_to(m)
 
         # Drop marker
         if st.session_state.drop:
@@ -357,60 +421,129 @@ with tab_app:
                 tooltip="Drop",
                 icon=folium.Icon(color="red")
             ).add_to(m)
+        map_placeholder = st.empty()
 
-        map_data = st_folium(
-            m,
-            width="100%",
-            height=500,
-            key="pickup_map"
-        )
+        with map_placeholder:
+            map_data = st_folium(
+                m,
+                width="100%",
+                height=500,
+                center=st.session_state.map_center,
+                zoom=st.session_state.map_zoom,
+                key="pickup_map"
+            )
+        
 
-        # 👇 KEEP THIS INSIDE THE BLOCK
-        if map_data and map_data.get("last_clicked"):
+            # Save map position
+        if map_data:
+            if map_data.get("center"):
+                st.session_state.map_center = [
+                    map_data["center"]["lat"],
+                    map_data["center"]["lng"]
+                ]
 
-            lat = map_data["last_clicked"]["lat"]
-            lon = map_data["last_clicked"]["lng"]
+            if map_data.get("zoom"):
+                st.session_state.map_zoom = map_data["zoom"]
+
+        # Process only real map clicks
+        clicked = map_data.get("last_clicked") if map_data else None
+
+        if clicked is not None:
+
+            lat = clicked["lat"]
+            lon = clicked["lng"]
 
             location = geolocator.reverse((lat, lon), language="en")
             address = location.address if location else "Unknown Location"
 
+    # KEEP your existing pickup / stop / drop logic here
+
+            # 1️⃣ Pickup
             if st.session_state.pickup is None:
                 st.session_state.pickup = (lat, lon)
                 st.session_state.pickup_address = address
 
+            # 2️⃣ Stop
+            elif st.session_state.adding_stop:
+                idx = st.session_state.stops.index(None)
+                st.session_state.stops[idx] = (lat, lon)
+                st.session_state.stop_addresses[idx] = address
+                st.session_state.adding_stop = False
+
+            # 3️⃣ Drop
             elif st.session_state.drop is None:
                 st.session_state.drop = (lat, lon)
                 st.session_state.drop_address = address
 
+            # 4️⃣ New Trip
             else:
                 st.session_state.pickup = (lat, lon)
                 st.session_state.pickup_address = address
                 st.session_state.drop = None
                 st.session_state.drop_address = ""
+                st.session_state.stops = []
+                st.session_state.stop_addresses = []
+                st.session_state.adding_stop = False
 
             st.rerun()
 
+        # ---------------- Pickup ----------------
         if st.session_state.pickup:
             p_lat, p_lon = st.session_state.pickup
             st.success("🟢 Pickup")
             st.write(st.session_state.pickup_address)
 
+        # ---------------- Stops ----------------
+        for i, stop in enumerate(st.session_state.stops):
+            if stop:
+                st.warning(f"🟠 Stop {i+1}")
+                st.write(st.session_state.stop_addresses[i])
+
+        # ---------------- Drop ----------------
         if st.session_state.drop:
             d_lat, d_lon = st.session_state.drop
             st.error("🔴 Drop")
             st.write(st.session_state.drop_address)
+        # ==========================================
+        # ROUTE ORDER (OLA / UBER STYLE)
+        # ==========================================
 
-        if st.button("Clear Selection"):
+        st.markdown("### 🛣️ Route Order")
+
+        route_points = []
+
+        if st.session_state.pickup_address:
+            route_points.append(f"🟢 Pickup: {st.session_state.pickup_address}")
+
+        for i, address in enumerate(st.session_state.stop_addresses):
+            if address:
+                route_points.append(f"🟠 Stop {i+1}: {address}")
+
+        if st.session_state.drop_address:
+            route_points.append(f"🔴 Drop: {st.session_state.drop_address}")
+
+        for point in route_points:
+            st.markdown(point)
+
+        if st.button("🗑 Clear Trip"):
             st.session_state.pickup = None
             st.session_state.drop = None
             st.session_state.pickup_address = ""
             st.session_state.drop_address = ""
+            st.session_state.stops = []
+            st.session_state.stop_addresses = []
             st.rerun()
     # --------------------------------------------------
     # Fetch Route from OSRM
     # --------------------------------------------------
     with st.spinner("Fetching shortest driving path from OSRM..."):
-        route_res = route_engine.get_osrm_route(p_lat, p_lon, d_lat, d_lon)
+        route_res = route_engine.get_osrm_route(
+            p_lat,
+            p_lon,
+            d_lat,
+            d_lon,
+            stops=st.session_state.stops
+        )
 
     route_dist_km = route_res["distance_km"]
     route_dur_min = route_res["duration_min"]
@@ -442,6 +575,18 @@ with tab_app:
             tooltip="🟢 Pickup",
             icon=folium.Icon(color="green", icon="play")
         ).add_to(route_map)
+        # ==========================================
+        # STOP MARKERS
+        # ==========================================
+
+        for i, stop in enumerate(st.session_state.stops):
+            if stop:
+                folium.Marker(
+                    [stop[0], stop[1]],
+                    popup=f"Stop {i+1}",
+                    tooltip=st.session_state.stop_addresses[i],
+                    icon=folium.Icon(color="orange", icon="flag")
+                ).add_to(route_map)
 
         # Drop marker
         folium.Marker(
