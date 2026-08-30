@@ -9,8 +9,7 @@ import json
 import folium
 from streamlit_folium import st_folium
 from geopy.geocoders import Nominatim
-
-# Import custom routing engine
+from math import sqrt
 import route_engine
 
 # --------------------------------------------------
@@ -167,6 +166,44 @@ def search_location(query):
         pass
 
     return None
+# =====================================================
+# AUTOMATIC TRAFFIC DETECTION ENGINE
+# =====================================================
+
+
+
+def calculate_traffic_level(p_lat, p_lon, d_lat, d_lon, hour, weather_flag):
+
+    score = 0
+
+    # Morning peak
+    if 8 <= hour <= 11:
+        score += 2
+
+    # Evening peak
+    if 17 <= hour <= 21:
+        score += 3
+
+    # Rain increases congestion
+    score += weather_flag
+
+    # Check if pickup/drop is near busy zones
+    for _, (zlat, zlon) in TRAFFIC_ZONES.items():
+
+        pickup_dist = sqrt((p_lat - zlat)**2 + (p_lon - zlon)**2)
+        drop_dist = sqrt((d_lat - zlat)**2 + (d_lon - zlon)**2)
+
+        if pickup_dist < 0.025 or drop_dist < 0.025:
+            score += 1
+
+    if score <= 1:
+        return "Low", 1.00
+
+    elif score <= 3:
+        return "Moderate", 1.22
+
+    else:
+        return "Heavy", 1.48
 # --------------------------------------------------
 # Mumbai Popular Locations
 # --------------------------------------------------
@@ -181,6 +218,18 @@ MUMBAI_LOCATIONS = {
     "Powai Lake / IIT Bombay": (19.1264, 72.9080),
     "Thane West Circle": (19.2183, 72.9781),
     "Vashi Station (Navi Mumbai)": (19.0771, 72.9986)
+}
+# =====================================================
+# MUMBAI TRAFFIC CONGESTION ZONES (Automatic Traffic)
+# =====================================================
+
+TRAFFIC_ZONES = {
+    "BKC": (19.0600, 72.8650),
+    "Dadar": (19.0180, 72.8430),
+    "Andheri": (19.1190, 72.8460),
+    "Sion": (19.0430, 72.8610),
+    "Powai": (19.1180, 72.9050),
+    "Airport": (19.0990, 72.8740)
 }
 
 # --------------------------------------------------
@@ -548,6 +597,24 @@ with tab_app:
     route_dist_km = route_res["distance_km"]
     route_dur_min = route_res["duration_min"]
     path_coords = route_res["path_coordinates"]
+    # =====================================================
+    # AUTOMATIC LIVE TRAFFIC CALCULATION
+    # =====================================================
+
+    traffic_level, traffic_multiplier = calculate_traffic_level(
+        p_lat,
+        p_lon,
+        d_lat,
+        d_lon,
+        hour,
+        weather_flag
+    )
+
+    # Save original ETA
+    base_duration = route_dur_min
+
+    # Apply automatic traffic multiplier
+    route_dur_min = round(base_duration * traffic_multiplier, 1)
 
     # --------------------------------------------------
     # Main View: Map & Summary Columns
@@ -596,11 +663,21 @@ with tab_app:
             icon=folium.Icon(color="red", icon="stop")
         ).add_to(route_map)
 
-        # Blue OSRM route
+       
+        # =====================================================
+        # TRAFFIC COLOURED ROUTE
+        # =====================================================
+
+        route_color = {
+            "Low": "#16A34A",        # Green
+            "Moderate": "#F59E0B",   # Orange
+            "Heavy": "#DC2626"       # Red
+        }[traffic_level]
+
         folium.PolyLine(
             locations=path_coords,
-            color="#2563EB",
-            weight=6,
+            color=route_color,
+            weight=7,
             opacity=0.9
         ).add_to(route_map)
 
@@ -610,6 +687,22 @@ with tab_app:
             height=500,
             key="route_display_map"
         )
+        # =====================================================
+        # TRAFFIC LEGEND
+        # =====================================================
+
+        st.markdown("#### 🚦 Traffic Legend")
+
+        lg1, lg2, lg3 = st.columns(3)
+
+        with lg1:
+            st.success("🟢 Low")
+
+        with lg2:
+            st.warning("🟠 Moderate")
+
+        with lg3:
+            st.error("🔴 Heavy")
         st.markdown("### 📍 Selected Locations")
 
         c1, c2 = st.columns(2)
@@ -651,6 +744,20 @@ with tab_app:
             </div>
         </div>
         """, unsafe_allow_html=True)
+        # =====================================================
+        # AUTOMATIC LIVE TRAFFIC STATUS
+        # =====================================================
+
+        st.markdown("### 🚦 Live Traffic Status")
+
+        if traffic_level == "Low":
+            st.success(f"🟢 Low Traffic • ETA: {route_dur_min} min")
+
+        elif traffic_level == "Moderate":
+            st.warning(f"🟠 Moderate Traffic • ETA: {route_dur_min} min")
+
+        else:
+            st.error(f"🔴 Heavy Traffic • ETA: {route_dur_min} min")
         
         st.write("")
         st.markdown("##### ⏱️ Peak & Weather Pricing Factors")
