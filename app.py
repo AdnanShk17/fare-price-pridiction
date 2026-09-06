@@ -11,6 +11,7 @@ from streamlit_folium import st_folium
 from geopy.geocoders import Nominatim
 from math import sqrt
 import route_engine
+from database import init_db, get_all_bookings, save_booking
 
 # --------------------------------------------------
 # Page Configuration
@@ -122,6 +123,8 @@ def load_model_metrics():
 model = load_model()
 platform_config = load_platform_config()
 metrics_info = load_model_metrics()
+# Initialize SQLite database
+init_db()
 # ==========================
 # Map Click Session State
 # ==========================
@@ -850,6 +853,26 @@ with tab_app:
             <span class="badge-tag">RTO Meter Rate</span>
         </div>
         """, unsafe_allow_html=True)
+    st.divider()
+
+if st.button("🚖 Confirm & Save Booking", use_container_width=True):
+
+    save_booking(
+        pickup=st.session_state.pickup_address,
+        dropoff=st.session_state.drop_address,
+        stops=", ".join([s for s in st.session_state.stop_addresses if s]),
+        distance=route_dist_km,
+        duration=route_dur_min,
+        traffic=traffic_level,
+        weather=weather_desc,
+        ola=round(ola_fare),
+        uber=round(uber_fare),
+        rapido=round(rapido_fare),
+        kp=round(kp_fare),
+        ml=round(final_model_fare)
+    )
+
+    st.success("✅ Booking saved successfully in SQLite!")
 
     # Bar chart breakdown
     st.write("")
@@ -940,3 +963,19 @@ with tab_report:
         **Q3: What makes this free-tier friendly?**  
         *Answer:* OpenStreetMap provides free map tiles, OSRM provides free routing queries, Scikit-Learn runs locally, and Streamlit hosts the dashboard without any API charges.
         """)
+st.divider()
+
+st.subheader("🗄 SQLite Booking Database")
+
+db = get_all_bookings()
+
+if db.empty:
+    st.info("No bookings available.")
+else:
+    st.success(f"Total Bookings: {len(db)}")
+
+    st.dataframe(
+        db,
+        use_container_width=True,
+        hide_index=True
+    )
