@@ -1,0 +1,13 @@
+streamlit>=1.35
+streamlit-folium>=0.20
+folium>=0.16
+geopy>=2.4
+requests>=2.31
+pandas>=2.0
+numpy>=1.26
+# The bundled model was trained with scikit-learn 1.8.0. A different version usually still loads,
+# but the app will warn - if results look odd just run: python train_mumbai_model.py
+scikit-learn>=1.5
+joblib>=1.3
+matplotlib>=3.8
+tzdata; platform_system == "Windows"

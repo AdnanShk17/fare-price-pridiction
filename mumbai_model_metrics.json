@@ -1,9 +1,67 @@
 {
-    "model_name": "RandomForestRegressor",
-    "dataset_records": 5000,
-    "mae": 9.68,
-    "rmse": 19.28,
-    "r2_score": 0.9954,
-    "target_currency": "INR (\u20b9)",
-    "city": "Mumbai, India"
+    "model_name": "Random Forest Regressor (predicts fare / baseline ratio)",
+    "data_source": "simulated",
+    "dataset_records": 7200,
+    "evaluation": "20% held-out split grouped by origin/destination cell (unseen route cells)",
+    "n_estimators": 150,
+    "max_depth": 12,
+    "min_samples_leaf": 5,
+    "features": [
+        "route_distance_km",
+        "route_duration_min",
+        "pickup_hour",
+        "is_peak",
+        "is_night",
+        "weather_flag"
+    ],
+    "mae": 11.54,
+    "rmse": 21.94,
+    "r2_score": 0.9995,
+    "mape_pct": 1.31,
+    "cv_mae_mean": 12.98,
+    "cv_mae_std": 1.9,
+    "linear_baseline": {
+        "mae": 80.86,
+        "rmse": 137.93,
+        "r2_score": 0.9817,
+        "mape_pct": 12.6
+    },
+    "mae_by_distance_band": {
+        "0-10km": {
+            "mae": 2.11,
+            "rmse": 2.9,
+            "r2_score": 0.998,
+            "mape_pct": 1.41
+        },
+        "10-20km": {
+            "mae": 4.94,
+            "rmse": 6.25,
+            "r2_score": 0.9945,
+            "mape_pct": 1.33
+        },
+        "20-40km": {
+            "mae": 8.85,
+            "rmse": 11.46,
+            "r2_score": 0.9946,
+            "mape_pct": 1.3
+        },
+        "40-+km": {
+            "mae": 29.67,
+            "rmse": 41.93,
+            "r2_score": 0.9986,
+            "mape_pct": 1.24
+        }
+    },
+    "feature_importance": {
+        "route_distance_km": 0.1258,
+        "route_duration_min": 0.0067,
+        "pickup_hour": 0.062,
+        "is_peak": 0.2719,
+        "is_night": 0.0813,
+        "weather_flag": 0.4524
+    },
+    "city": "Mumbai",
+    "currency": "INR",
+    "sklearn_version": "1.8.0",
+    "trained_on": "2026-10-09"
 }

@@ -1,981 +1,699 @@
-import streamlit as st
-import joblib
-import numpy as np
-import pandas as pd
-import pydeck as pdk
-from datetime import datetime
-import os
-import json
-import folium
-from streamlit_folium import st_folium
-from geopy.geocoders import Nominatim
-from math import sqrt
-import route_engine
-from database import init_db, get_all_bookings, save_booking
+"""FareCompass - compare cab fares across Mumbai (Streamlit web app)."""
+from __future__ import annotations
 
-# --------------------------------------------------
-# Page Configuration
-# --------------------------------------------------
+import json
+import logging
+import os
+import uuid
+from datetime import datetime, timedelta
+from pathlib import Path
+
+import folium
+import joblib
+import pandas as pd
+import streamlit as st
+from streamlit_folium import st_folium
+
+import fare_logic as fl
+import geo_utils
+import poi_service
+import route_engine
+import trip_time as tm
+import ui_components as ui
+import weather_service
+from branding import APP_NAME, APP_TAGLINE, CITY
+from database import get_bookings, init_db, save_booking
+
+logger = logging.getLogger(__name__)
+BASE_DIR = Path(__file__).resolve().parent
+MAX_STOPS = 3
+MAP_HEIGHT = 580
+MUMBAI_CENTER = [19.0760, 72.8777]
+
 st.set_page_config(
-    page_title="Mumbai's Smart Cab Fare System",
+    page_title=f"{APP_NAME} | {APP_TAGLINE}",
     page_icon="🚕",
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="collapsed",
 )
+st.markdown(ui.css(), unsafe_allow_html=True)
 
-# --------------------------------------------------
-# Custom CSS Styling
-# --------------------------------------------------
-st.markdown("""
-<style>
-@keyframes fadeIn {
-    from {opacity: 0; transform: translateY(10px);}
-    to {opacity: 1; transform: translateY(0);}
+# --------------------------------------------------------------------------
+# Static options
+# --------------------------------------------------------------------------
+VEHICLES = {"🛺 Auto": "Auto Rickshaw", "🚕 Taxi": "Kaali-Peeli Taxi", "🚗 Sedan": "Hatchback / Sedan", "🚙 SUV": "SUV Prime"}
+DEFAULT_VEHICLE = "🚗 Sedan"
+WEATHER_CHOICES = [("☀️ Clear", 0), ("🌧️ Rain", 1), ("⛈️ Heavy rain", 2)]
+PROVIDERS = {
+    "ola_mini": ("🟡", "Ola"),
+    "uber_go": ("⬛", "Uber"),
+    "rapido_bike_cab": ("🛵", "Rapido"),
+    "mumbai_kaali_peeli": ("🚕", "Kaali-Peeli Taxi"),
 }
-.main-header {
-    background: linear-gradient(135deg, #1e293b, #0f172a);
-    padding: 24px;
-    border-radius: 16px;
-    color: white;
-    box-shadow: 0 8px 24px rgba(0,0,0,0.3);
-    margin-bottom: 20px;
+# OpenStreetMap's standard tiles need no key (fine for development / light use). For a production launch set
+# MAP_TILE_URL / MAP_TILE_ATTR to a provider you have a licence or key for (MapTiler, Stadia, Mapbox, self-hosted...).
+TILE_URL = os.environ.get("MAP_TILE_URL", "https://tile.openstreetmap.org/{z}/{x}/{y}.png")
+TILE_ATTR = os.environ.get("MAP_TILE_ATTR", "© OpenStreetMap contributors")
+# Softens the colourful OSM tiles so the map looks calmer next to the interface (applies inside the map frame).
+MAP_STYLE = "<style>.leaflet-tile-pane{filter:grayscale(.45) saturate(.9) brightness(1.03);}</style>"
+TRIP_COLUMNS = {
+    "booking_time": "Saved on", "trip_time": "Trip time", "pickup": "Pickup", "dropoff": "Drop-off", "stops": "Stops",
+    "vehicle_type": "Ride type", "distance_km": "Distance (km)", "duration_min": "Time (min)", "traffic_level": "Traffic",
+    "weather": "Weather", "ml_fare": "Estimate (₹)", "ola_fare": "Ola (₹)", "uber_fare": "Uber (₹)",
+    "rapido_fare": "Rapido (₹)", "kaali_peeli_fare": "Taxi (₹)",
 }
-.fare-card {
-    background: linear-gradient(135deg, #0284c7, #0369a1);
-    padding: 24px;
-    border-radius: 16px;
-    text-align: center;
-    color: white;
-    box-shadow: 0 10px 25px rgba(2, 132, 199, 0.3);
-    animation: fadeIn 0.5s ease-in-out;
-}
-.fare-amount {
-    font-size: 42px;
-    font-weight: 800;
-}
-.fare-label {
-    font-size: 16px;
-    opacity: 0.9;
-    text-transform: uppercase;
-    letter-spacing: 1px;
-}
-.platform-card {
-    background: #1e293b;
-    border: 1px solid #334155;
-    border-radius: 14px;
-    padding: 18px;
-    text-align: center;
-    color: white;
-    margin-bottom: 12px;
-    transition: transform 0.2s ease;
-}
-.platform-card:hover {
-    transform: translateY(-3px);
-    border-color: #38bdf8;
-}
-.platform-price {
-    font-size: 28px;
-    font-weight: 700;
-    color: #38bdf8;
-}
-.platform-name {
-    font-size: 15px;
-    font-weight: 600;
-    margin-bottom: 6px;
-}
-.badge-tag {
-    background-color: #334155;
-    color: #f8fafc;
-    padding: 4px 10px;
-    border-radius: 8px;
-    font-size: 12px;
-    font-weight: 600;
-}
-</style>
-""", unsafe_allow_html=True)
 
-# --------------------------------------------------
-# Load Model & Platform Fares Config
-# --------------------------------------------------
+
+# --------------------------------------------------------------------------
+# Cached services
+# --------------------------------------------------------------------------
 @st.cache_resource
-def load_model():
-    model_path = os.path.join(os.path.dirname(__file__), "mumbai_cab_fare_model.pkl")
-    if os.path.exists(model_path):
-        return joblib.load(model_path)
-    return None
-
-@st.cache_data
-def load_platform_config():
-    config_path = os.path.join(os.path.dirname(__file__), "platform_fares.json")
-    if os.path.exists(config_path):
-        with open(config_path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return {}
-
-@st.cache_data
-def load_model_metrics():
-    metrics_path = os.path.join(os.path.dirname(__file__), "mumbai_model_metrics.json")
-    if os.path.exists(metrics_path):
-        with open(metrics_path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return {}
-
-model = load_model()
-platform_config = load_platform_config()
-metrics_info = load_model_metrics()
-# Initialize SQLite database
-init_db()
-# ==========================
-# Map Click Session State
-# ==========================
-if "pickup" not in st.session_state:
-    st.session_state.pickup = None
-
-if "drop" not in st.session_state:
-    st.session_state.drop = None
-if "pickup_address" not in st.session_state:
-    st.session_state.pickup_address = ""
-
-if "drop_address" not in st.session_state:
-    st.session_state.drop_address = ""
-# ==========================================
-# INTERMEDIATE STOPS SESSION STATE
-# ==========================================
-
-if "stops" not in st.session_state:
-    st.session_state.stops = []
-
-if "stop_addresses" not in st.session_state:
-    st.session_state.stop_addresses = []
-if "adding_stop" not in st.session_state:
-    st.session_state.adding_stop = False
-if "map_center" not in st.session_state:
-    st.session_state.map_center = [19.0760, 72.8777]
-
-if "map_zoom" not in st.session_state:
-    st.session_state.map_zoom = 11
-
-geolocator = Nominatim(user_agent="mumbai_fare_app")
-def search_location(query):
+def load_fare_estimator():
+    path = BASE_DIR / "mumbai_cab_fare_model.pkl"
     try:
-        location = geolocator.geocode(query + ", Mumbai, Maharashtra")
-        if location:
-            return (
-                location.latitude,
-                location.longitude,
-                location.address
-            )
-    except:
-        pass
-
-    return None
-# =====================================================
-# AUTOMATIC TRAFFIC DETECTION ENGINE
-# =====================================================
+        return joblib.load(path)
+    except Exception as exc:  # missing / incompatible file -> use the rule-based formula
+        logger.warning("Fare estimator file unavailable (%s); using the rule-based formula", exc)
+        return None
 
 
-
-def calculate_traffic_level(p_lat, p_lon, d_lat, d_lon, hour, weather_flag):
-
-    score = 0
-
-    # Morning peak
-    if 8 <= hour <= 11:
-        score += 2
-
-    # Evening peak
-    if 17 <= hour <= 21:
-        score += 3
-
-    # Rain increases congestion
-    score += weather_flag
-
-    # Check if pickup/drop is near busy zones
-    for _, (zlat, zlon) in TRAFFIC_ZONES.items():
-
-        pickup_dist = sqrt((p_lat - zlat)**2 + (p_lon - zlon)**2)
-        drop_dist = sqrt((d_lat - zlat)**2 + (d_lon - zlon)**2)
-
-        if pickup_dist < 0.025 or drop_dist < 0.025:
-            score += 1
-
-    if score <= 1:
-        return "Low", 1.00
-
-    elif score <= 3:
-        return "Moderate", 1.22
-
-    else:
-        return "Heavy", 1.48
-# --------------------------------------------------
-# Mumbai Popular Locations
-# --------------------------------------------------
-MUMBAI_LOCATIONS = {
-    "Chhatrapati Shivaji Maharaj Terminus (CST)": (18.9400, 72.8353),
-    "Marine Drive / Nariman Point": (18.9438, 72.8234),
-    "Dadar TT Circle": (19.0178, 72.8478),
-    "Bandra Kurla Complex (BKC)": (19.0657, 72.8687),
-    "Bandra Station / Bandstand": (19.0596, 72.8295),
-    "Andheri Station / WEH": (19.1197, 72.8464),
-    "Mumbai Airport T2 (CSMI)": (19.0896, 72.8656),
-    "Powai Lake / IIT Bombay": (19.1264, 72.9080),
-    "Thane West Circle": (19.2183, 72.9781),
-    "Vashi Station (Navi Mumbai)": (19.0771, 72.9986)
-}
-# =====================================================
-# MUMBAI TRAFFIC CONGESTION ZONES (Automatic Traffic)
-# =====================================================
-
-TRAFFIC_ZONES = {
-    "BKC": (19.0600, 72.8650),
-    "Dadar": (19.0180, 72.8430),
-    "Andheri": (19.1190, 72.8460),
-    "Sion": (19.0430, 72.8610),
-    "Powai": (19.1180, 72.9050),
-    "Airport": (19.0990, 72.8740)
-}
-
-# --------------------------------------------------
-# Application Header
-# --------------------------------------------------
-st.markdown("""
-<div class="main-header">
-    <h2 style="margin:0; padding:0; color:#38bdf8;">🚕 Mumbai Smart Cab Fare & Route Comparison System</h2>
-    <p style="margin:6px 0 0 0; opacity:0.85;">Machine Learning Fare Prediction • OSRM Shortest Driving Path • Multi-Platform Estimation Engine</p>
-</div>
-""", unsafe_allow_html=True)
-
-# --------------------------------------------------
-# Main Navigation Tabs
-# --------------------------------------------------
-tab_app, tab_report = st.tabs(["🚀 Fare Prediction & Route Finder", "📚 Guide Report & Viva Defense"])
-
-with tab_app:
-    # --------------------------------------------------
-    # Sidebar Input Layout
-    # --------------------------------------------------
-    st.sidebar.header("📍 Trip Parameters")
-    
-    input_mode = st.sidebar.radio(
-    "Location Mode",
-    ["Popular Mumbai Hubs", "Click on Map", "Custom Coordinates"]
-    )
-    
-    # ==========================================
-    # LOCATION INPUT
-    # ==========================================
-
-    if input_mode == "Popular Mumbai Hubs":
-
-        pickup_name = st.sidebar.selectbox(
-            "Pickup Location",
-            list(MUMBAI_LOCATIONS.keys()),
-            index=0
-        )
-
-        dropoff_options = [
-            loc for loc in MUMBAI_LOCATIONS.keys()
-            if loc != pickup_name
-        ]
-
-        dropoff_name = st.sidebar.selectbox(
-            "Dropoff Location",
-            dropoff_options,
-            index=4
-        )
-
-        p_lat, p_lon = MUMBAI_LOCATIONS[pickup_name]
-        d_lat, d_lon = MUMBAI_LOCATIONS[dropoff_name]
+@st.cache_data
+def load_metrics() -> dict:
+    path = BASE_DIR / "mumbai_model_metrics.json"
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return {}
 
 
-    elif input_mode == "Custom Coordinates":
-
-        p_lat = st.sidebar.number_input(
-            "Pickup Latitude",
-            value=19.0760,
-            format="%.4f"
-        )
-
-        p_lon = st.sidebar.number_input(
-            "Pickup Longitude",
-            value=72.8777,
-            format="%.4f"
-        )
-
-        d_lat = st.sidebar.number_input(
-            "Dropoff Latitude",
-            value=19.0896,
-            format="%.4f"
-        )
-
-        d_lon = st.sidebar.number_input(
-            "Dropoff Longitude",
-            value=72.8656,
-            format="%.4f"
-        )
-
-        pickup_name = "Custom Pickup"
-        dropoff_name = "Custom Drop"
+@st.cache_data(ttl=1800, show_spinner=False)
+def _osrm_cached(points: tuple) -> dict:
+    return route_engine.fetch_osrm_route(points)  # raises RouteError (never cached)
 
 
-    else:
-        # Click on Map mode
+def get_route(points: list) -> dict:
+    key = tuple((round(lat, 6), round(lon, 6)) for lat, lon in points)
+    try:
+        return _osrm_cached(key)
+    except route_engine.RouteError as exc:
+        return route_engine.fallback_route(points, str(exc))
 
-        pickup_name = "Map Pickup"
-        dropoff_name = "Map Drop"
 
-        if st.session_state.pickup:
-            p_lat, p_lon = st.session_state.pickup
-        else:
-            p_lat, p_lon = 19.0760, 72.8777
+@st.cache_data(ttl=3600, show_spinner=False)
+def cached_search(query: str):
+    return geo_utils.search_location(query)
 
-        if st.session_state.drop:
-            d_lat, d_lon = st.session_state.drop
-        else:
-            d_lat, d_lon = 19.0896, 72.8656
 
-    st.sidebar.divider()
-    st.sidebar.header("🚗 Trip Options")
-    
-    vehicle_type = st.sidebar.selectbox("Vehicle Category", ["Auto Rickshaw", "Kaali-Peeli Taxi", "Hatchback / Sedan", "SUV Prime"])
-    passengers = st.sidebar.number_input("Passengers", 1, 4, 1)
-    
-    hour = st.sidebar.slider("Trip Time (Hour)", 0, 23, 14, format="%d:00")
-    day_idx = st.sidebar.selectbox("Day of Week", ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"], index=1)
-    day_of_week = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"].index(day_idx)
-    
-    weather_desc = st.sidebar.selectbox("Weather Condition", ["Sunny / Clear ☀️", "Monsoon Rain 🌧️", "Heavy Torrential Rain ⛈️"])
-    weather_flag = 0 if "Sunny" in weather_desc else (1 if "Monsoon Rain" in weather_desc else 2)
+@st.cache_data(ttl=3600, show_spinner=False)
+def cached_reverse(lat: float, lon: float) -> str:
+    return geo_utils.reverse_geocode(lat, lon)
 
-    st.sidebar.divider()
-    st.sidebar.header("🗺️ Map Style")
-    map_tile_choice = st.sidebar.selectbox("Map Tile Provider", [
-        "OpenStreetMap (Default)",
-        "CartoDB Positron (Light)",
-        "CartoDB Dark Matter (Dark)",
-        "Esri World Street Map"
-    ])
 
-    # Tile style mapping
-    tile_urls = {
-        "OpenStreetMap (Default)": "https://a.tile.openstreetmap.org/{z}/{x}/{y}.png",
-        "CartoDB Positron (Light)": "https://basemaps.cartocdn.com/rastertiles/light_all/{z}/{x}/{y}.png",
-        "CartoDB Dark Matter (Dark)": "https://basemaps.cartocdn.com/rastertiles/dark_all/{z}/{x}/{y}.png",
-        "Esri World Street Map": "https://server.arcgisonline.com/ArcGIS/rest/services/World_Street_Map/MapServer/tile/{z}/{y}/{x}"
+@st.cache_data(ttl=900, show_spinner=False)
+def _weather_cached(lat: float, lon: float, hour_key: str) -> dict:
+    return weather_service.fetch_weather(lat, lon, datetime.strptime(hour_key, "%Y-%m-%dT%H:00"))
+
+
+def get_weather(lat: float, lon: float, when) -> dict:
+    try:
+        return _weather_cached(round(lat, 2), round(lon, 2), when.strftime("%Y-%m-%dT%H:00"))
+    except weather_service.WeatherError as exc:
+        return {"success": False, "error": str(exc)}
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def _poi_cached(path_key: tuple, radius_m: int, categories: tuple) -> list:
+    return poi_service.fetch_pois(list(path_key), radius_m, categories)  # raises PoiError (never cached)
+
+
+def get_pois(path: list, radius_m: int, categories: list):
+    key = tuple((round(a, 5), round(b, 5)) for a, b in poi_service.simplify_path(path))
+    try:
+        return _poi_cached(key, int(radius_m), tuple(categories)), None
+    except poi_service.PoiError as exc:
+        return [], str(exc)
+
+
+try:
+    platform_config = fl.load_config()
+except (OSError, ValueError) as exc:
+    st.error(f"The service is temporarily unavailable (configuration error: {exc}).")
+    st.stop()
+
+fare_estimator = load_fare_estimator()
+init_db()
+
+
+# --------------------------------------------------------------------------
+# Session state + callbacks
+# --------------------------------------------------------------------------
+def init_state() -> None:
+    sched_date, sched_time = tm.default_schedule()
+    defaults = {
+        "sched_date": sched_date, "sched_time": sched_time,
+        "session_id": uuid.uuid4().hex,
+        "pickup": None, "drop": None, "pickup_address": "", "drop_address": "",
+        "stops": [], "stop_addresses": [], "adding_stop": False,
+        "last_click": None, "search_msg": None, "trip_saved": False,
+        "map_center": list(MUMBAI_CENTER), "map_zoom": 11,
     }
-    
-    # ==========================================
-    # CLICKABLE MAP
-    # ==========================================
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
 
-    if input_mode == "Click on Map":
 
-        st.subheader("🗺️ Select Your Trip")
-        # ==========================================
-        # ADD / REMOVE STOPS
-        # ==========================================
+init_state()
 
-        col_add, col_remove = st.columns(2)
 
-        with col_add:
-            if st.button("➕ Add Stop", use_container_width=True):
-                if len(st.session_state.stops) < 3:
-                    st.session_state.stops.append(None)
-                    st.session_state.stop_addresses.append("")
-                    st.session_state.adding_stop = True    
-        with col_remove:
-            if st.button("🗑 Clear Stops"):
-                st.session_state.stops = []
-                st.session_state.stop_addresses = []
+def clear_stops() -> None:
+    st.session_state.stops = []
+    st.session_state.stop_addresses = []
+    st.session_state.adding_stop = False
 
-        # ==========================================
-        # DISPLAY STOPS
-        # ==========================================
-        if len(st.session_state.stops) > 0:
 
-            st.markdown("### 🚏 Intermediate Stops")
+def clear_trip() -> None:
+    # last_click is deliberately kept: the map component keeps re-sending its last click,
+    # and forgetting it here would re-apply that stale click as a new pickup.
+    ss = st.session_state
+    ss.pickup = ss.drop = None
+    ss.pickup_address = ss.drop_address = ""
+    ss.search_msg = None
+    clear_stops()
 
-            for i in range(len(st.session_state.stops)):
-                if st.session_state.stops[i] is not None:
-                    st.success(f"🟠 Stop {i+1}")
-                    st.write(st.session_state.stop_addresses[i])
-                else:
-                    st.warning(f"🟠 Stop {i+1}: Click on the map below to select")
 
-        colA, colB = st.columns(2)
+def clear_point(kind: str) -> None:
+    ss = st.session_state
+    ss[kind] = None
+    ss[f"{kind}_address"] = ""
 
-        with colA:
-            pickup_search = st.text_input(
-                "🔍 Search Pickup",
-                placeholder="e.g. Bandra Station"
-        )
 
-        with colB:
-            drop_search = st.text_input(
-                "🔍 Search Drop",
-                placeholder="e.g. Mumbai Airport T2"
-        )
-        st.caption("1st click = Pickup • 2nd click = Drop • 3rd click = Start a new trip")
+def remove_stop(index: int) -> None:
+    ss = st.session_state
+    if 0 <= index < len(ss.stops):
+        ss.stops.pop(index)
+        ss.stop_addresses.pop(index)
+    ss.adding_stop = None in ss.stops
 
-        tile_attr = {
-            "OpenStreetMap (Default)": "© OpenStreetMap contributors",
-            "CartoDB Positron (Light)": "© OpenStreetMap contributors © CARTO",
-            "CartoDB Dark Matter (Dark)": "© OpenStreetMap contributors © CARTO",
-            "Esri World Street Map": "Tiles © Esri"
-        }
 
-        m = folium.Map(
-            location=st.session_state.map_center,
-            zoom_start=st.session_state.map_zoom,
-            tiles=tile_urls[map_tile_choice],
-            attr=tile_attr[map_tile_choice]
-        )
-        # ==========================================
-        # SEARCH PICKUP & DROP
-        # ==========================================
+def add_stop() -> None:
+    ss = st.session_state
+    if len(ss.stops) < MAX_STOPS and None not in ss.stops:
+        ss.stops.append(None)
+        ss.stop_addresses.append("")
+    ss.adding_stop = None in ss.stops
 
-        if pickup_search:
-            result = search_location(pickup_search)
-            if result:
-                lat, lon, address = result
-                st.session_state.pickup = (lat, lon)
-                st.session_state.pickup_address = address
-                p_lat, p_lon = lat, lon
 
-        if drop_search:
-            result = search_location(drop_search)
-            if result:
-                lat, lon, address = result
-                st.session_state.drop = (lat, lon)
-                st.session_state.drop_address = address
-                d_lat, d_lon = lat, lon
+def add_poi_as_stop(lat: float, lon: float, name: str) -> None:
+    ss = st.session_state
+    if None in ss.stops:
+        idx = ss.stops.index(None)
+        ss.stops[idx], ss.stop_addresses[idx] = (lat, lon), name
+    elif len(ss.stops) < MAX_STOPS:
+        ss.stops.append((lat, lon))
+        ss.stop_addresses.append(name)
+    ss.adding_stop = None in ss.stops
 
-        # Pickup marker
-        if st.session_state.pickup:
-            folium.Marker(
-                st.session_state.pickup,
-                tooltip="Pickup",
-                icon=folium.Icon(color="green")
-            ).add_to(m)
-        # Stop markers
-        for i, stop in enumerate(st.session_state.stops):
+
+def set_from_search(kind: str) -> None:
+    ss = st.session_state
+    query = (ss.get(f"{kind}_search") or "").strip()
+    result = cached_search(query) if query else None
+    if not result:
+        ss.search_msg = f"We couldn't find “{query}” in {CITY}. Try a nearby landmark or area name." if query \
+            else "Type a place name first."
+        return
+    lat, lon, address = result
+    ss[kind], ss[f"{kind}_address"] = (lat, lon), address
+    ss.map_center, ss.map_zoom = [lat, lon], 14
+    ss.search_msg = None
+
+
+def handle_map_click(map_data) -> bool:
+    """Apply a NEW map click to the next empty slot (pickup -> stop -> drop). True if state changed."""
+    clicked = map_data.get("last_clicked") if map_data else None
+    if not clicked:
+        return False
+    lat, lon = float(clicked["lat"]), float(clicked["lng"])
+    key = (round(lat, 6), round(lon, 6))
+    ss = st.session_state
+    if ss.last_click == key:  # the map component re-sends its last click on every rerun
+        return False
+    ss.last_click = key
+
+    if ss.adding_stop and None in ss.stops and ss.pickup is not None:
+        slot = "stop"
+    elif ss.pickup is None:
+        slot = "pickup"
+    elif ss.drop is None:
+        slot = "drop"
+    else:
+        return False  # route is complete - use Reset / the ✕ buttons to change it
+    address = cached_reverse(round(lat, 5), round(lon, 5))
+    if slot == "stop":
+        idx = ss.stops.index(None)
+        ss.stops[idx], ss.stop_addresses[idx] = (lat, lon), address
+        ss.adding_stop = None in ss.stops
+    else:
+        ss[slot], ss[f"{slot}_address"] = (lat, lon), address
+    return True
+
+
+# --------------------------------------------------------------------------
+# Planner (left column)
+# --------------------------------------------------------------------------
+def render_planner() -> dict:
+    ss = st.session_state
+    with st.container(border=True):
+        st.markdown(ui.section_title("Plan your ride", "Tap the map or search to set your route"), unsafe_allow_html=True)
+
+        if ss.pickup is None:
+            banner = ui.step_banner("Tap the map to set your pickup point", "1")
+        elif ss.adding_stop and None in ss.stops:
+            banner = ui.step_banner(f"Tap the map to place stop {ss.stops.index(None) + 1}", "•")
+        elif ss.drop is None:
+            banner = ui.step_banner("Now tap the map to set your drop-off point", "2")
+        else:
+            banner = ui.step_banner("Route ready - compare fares below", done=True)
+        st.markdown(banner, unsafe_allow_html=True)
+
+        # ---- pickup
+        st.markdown(ui.label("Pickup"), unsafe_allow_html=True)
+        c1, c2 = st.columns([4, 1])
+        c1.text_input("Pickup location", key="pickup_search", placeholder="Search a place in Mumbai",
+                      label_visibility="collapsed")
+        c2.button("Search", key="pickup_go", on_click=set_from_search, args=("pickup",))
+        if ss.pickup:
+            c1, c2 = st.columns([6, 1])
+            c1.markdown(ui.location_chip("#16A34A", "Pickup", ss.pickup_address), unsafe_allow_html=True)
+            c2.button("✕", key="clear_pickup", on_click=clear_point, args=("pickup",), help="Remove pickup")
+
+        # ---- stops
+        for i, (stop, address) in enumerate(zip(ss.stops, ss.stop_addresses)):
+            c1, c2 = st.columns([6, 1])
+            c1.markdown(ui.location_chip("#F59E0B", f"Stop {i + 1}", address if stop else "Tap the map to place this stop"),
+                        unsafe_allow_html=True)
+            c2.button("✕", key=f"remove_stop_{i}", on_click=remove_stop, args=(i,), help="Remove stop")
+        b1, b2 = st.columns(2)
+        b1.button("＋ Add a stop", key="add_stop", on_click=add_stop,
+                  disabled=ss.pickup is None or (len(ss.stops) >= MAX_STOPS and None not in ss.stops))
+        if ss.stops:
+            b2.button("Clear stops", key="clear_stops", on_click=clear_stops)
+
+        # ---- drop-off
+        st.markdown(ui.label("Drop-off"), unsafe_allow_html=True)
+        c1, c2 = st.columns([4, 1])
+        c1.text_input("Drop-off location", key="drop_search", placeholder="Search a place in Mumbai",
+                      label_visibility="collapsed")
+        c2.button("Search", key="drop_go", on_click=set_from_search, args=("drop",))
+        if ss.drop:
+            c1, c2 = st.columns([6, 1])
+            c1.markdown(ui.location_chip("#DC2626", "Drop-off", ss.drop_address), unsafe_allow_html=True)
+            c2.button("✕", key="clear_drop", on_click=clear_point, args=("drop",), help="Remove drop-off")
+        if ss.search_msg:
+            st.warning(ss.search_msg)
+
+        # ---- when
+        st.markdown(ui.label("When"), unsafe_allow_html=True)
+        when_choice = st.radio("When", ["Leave now", "Schedule for later"], horizontal=True, label_visibility="collapsed")
+        now = tm.now_ist()
+        if when_choice == "Leave now":
+            trip_dt, time_msg = now, None
+        else:
+            if ss.sched_date < now.date():  # page left open overnight
+                ss.sched_date, ss.sched_time = tm.default_schedule(now)
+            d1, d2 = st.columns(2)
+            d1.date_input("Date", min_value=now.date(), max_value=now.date() + timedelta(days=tm.MAX_ADVANCE_DAYS),
+                          key="sched_date")
+            d2.time_input("Time", key="sched_time", step=900)
+            trip_dt, time_msg = tm.resolve_trip_datetime("scheduled", ss.sched_date, ss.sched_time, now)
+        if time_msg:
+            st.warning(time_msg)
+
+        # ---- ride type
+        st.markdown(ui.label("Ride type"), unsafe_allow_html=True)
+        vehicle_label = st.radio("Ride type", list(VEHICLES), index=list(VEHICLES).index(DEFAULT_VEHICLE),
+                                 horizontal=True, label_visibility="collapsed")
+
+        with st.expander("⚙️ Preferences"):
+            manual_weather = st.toggle("Set weather manually", key="manual_weather",
+                                       help="By default the weather is detected automatically for your trip time.")
+            manual_choice = None
+            if manual_weather:
+                manual_choice = st.selectbox("Weather", [w[0] for w in WEATHER_CHOICES], key="manual_weather_choice")
+            show_suggestions = st.checkbox("Show food, shopping & sights along the route", value=True, key="show_suggestions")
+            categories = st.multiselect("What to look for", list(poi_service.CATEGORY_LABELS),
+                                        default=list(poi_service.CATEGORY_LABELS),
+                                        format_func=lambda c: poi_service.CATEGORY_LABELS[c])
+            radius = st.slider("Distance from route (m)", 200, 1000, 500, step=100)
+
+        st.button("Reset trip", key="reset_trip", on_click=clear_trip)
+
+    return {
+        "trip_dt": trip_dt, "scheduled": when_choice != "Leave now",
+        "vehicle_label": vehicle_label, "vehicle_type": VEHICLES[vehicle_label],
+        "manual_weather": manual_weather, "manual_choice": manual_choice,
+        "show_suggestions": show_suggestions, "categories": categories, "radius": radius,
+    }
+
+
+def resolve_weather(cfg: dict) -> dict:
+    """Detected (or manually chosen) weather for the trip hour."""
+    if not cfg["manual_weather"]:
+        lat, lon = st.session_state.pickup or MUMBAI_CENTER
+        info = get_weather(lat, lon, cfg["trip_dt"])
+        if info["success"]:
+            return {"flag": info["flag"], "desc": info["description"], "icon": info["icon"], "info": info,
+                    "auto": True, "failed": False}
+        failed = True
+    else:
+        failed = False
+    label = cfg["manual_choice"] or WEATHER_CHOICES[0][0]
+    icon, flag = next((w[0].split(" ")[0], w[1]) for w in WEATHER_CHOICES if w[0] == label)
+    return {"flag": flag, "desc": label.split(" ", 1)[1], "icon": icon, "info": None, "auto": False, "failed": failed}
+
+
+# --------------------------------------------------------------------------
+# Quote + map + results
+# --------------------------------------------------------------------------
+def compute_quote(route_res: dict, cfg: dict, weather: dict) -> dict:
+    (p_lat, p_lon), (d_lat, d_lon) = st.session_state.pickup, st.session_state.drop
+    hour, flag = cfg["trip_dt"].hour, weather["flag"]
+    traffic_level, traffic_mult = fl.traffic_level(p_lat, p_lon, d_lat, d_lon, hour, flag)
+    dist = route_res["distance_km"]
+    duration = round(route_res["duration_min"] * traffic_mult, 1)
+
+    base_fares = fl.all_platform_fares(platform_config, dist, duration, hour, flag)
+    fares = fl.vehicle_fares(platform_config, dist, duration, hour, flag, cfg["vehicle_type"])
+    base_estimate = (fare_estimator.predict_one(dist, duration, hour, flag) if fare_estimator is not None
+                     else fl.fair_price(base_fares))
+    return {
+        "distance_km": dist, "duration_min": duration, "traffic": traffic_level, "fares": fares,
+        "estimate": round(base_estimate * fl.VEHICLE_MULTIPLIERS[cfg["vehicle_type"]]),
+        "arrival": cfg["trip_dt"] + timedelta(minutes=duration),
+    }
+
+
+def base_map(location, zoom) -> "folium.Map":
+    m = folium.Map(location=location, zoom_start=zoom, tiles=TILE_URL, attr=TILE_ATTR, control_scale=True)
+    m.get_root().header.add_child(folium.Element(MAP_STYLE))
+    return m
+
+
+def render_map(route_res, ranked: dict, stop_pts: list, stop_labels: list) -> None:
+    ss = st.session_state
+    if route_res is None:  # ---- selection phase
+        m = base_map(ss.map_center, ss.map_zoom)
+        if ss.pickup:
+            folium.Marker(ss.pickup, tooltip="Pickup", icon=folium.Icon(color="green", icon="play")).add_to(m)
+        for i, stop in enumerate(ss.stops):
             if stop is not None:
-                folium.Marker(
-                    stop,
-                    tooltip=f"Stop {i+1}",
-                    icon=folium.Icon(color="orange", icon="flag")
-                ).add_to(m)
+                folium.Marker(stop, tooltip=f"Stop {i + 1}", icon=folium.Icon(color="orange", icon="flag")).add_to(m)
+        if ss.drop:
+            folium.Marker(ss.drop, tooltip="Drop-off", icon=folium.Icon(color="red", icon="stop")).add_to(m)
+        data = st_folium(m, width="100%", height=MAP_HEIGHT, center=ss.map_center, zoom=ss.map_zoom,
+                         key="map_select", returned_objects=["last_clicked", "center", "zoom"])
+        if data:
+            if data.get("center"):
+                ss.map_center = [data["center"]["lat"], data["center"]["lng"]]
+            if data.get("zoom"):
+                ss.map_zoom = data["zoom"]
+    else:  # ---- route phase
+        (p_lat, p_lon), (d_lat, d_lon) = ss.pickup, ss.drop
+        m = base_map([(p_lat + d_lat) / 2, (p_lon + d_lon) / 2], 12)
+        path = route_res["path_coordinates"]
+        dashed = None if route_res["success"] else "8"
+        folium.PolyLine(path, color="#FFFFFF", weight=10, opacity=0.9).add_to(m)
+        folium.PolyLine(path, color="#1D4ED8", weight=5, opacity=0.95, dash_array=dashed).add_to(m)
+        folium.Marker([p_lat, p_lon], tooltip=f"Pickup: {ss.pickup_address}"[:120],
+                      icon=folium.Icon(color="green", icon="play")).add_to(m)
+        for i, (stop, label) in enumerate(zip(stop_pts, stop_labels)):
+            folium.Marker(list(stop), tooltip=f"Stop {i + 1}: {label}"[:120],
+                          icon=folium.Icon(color="orange", icon="flag")).add_to(m)
+        folium.Marker([d_lat, d_lon], tooltip=f"Drop-off: {ss.drop_address}"[:120],
+                      icon=folium.Icon(color="red", icon="stop")).add_to(m)
+        for cat, places in ranked.items():
+            color, glyph = poi_service.CATEGORY_MARKERS[cat]
+            for p in places:
+                folium.Marker([p["lat"], p["lon"]], tooltip=f"{poi_service.CATEGORY_LABELS[cat].split(' ')[0]} {p['name']}",
+                              popup=f"{p['name']} · about {p['minutes_into_trip']} min into the trip",
+                              icon=folium.Icon(color=color, icon=glyph, prefix="glyphicon")).add_to(m)
+        m.fit_bounds([[min(c[0] for c in path), min(c[1] for c in path)],
+                      [max(c[0] for c in path), max(c[1] for c in path)]])
+        data = st_folium(m, width="100%", height=MAP_HEIGHT, key="map_route", returned_objects=["last_clicked"])
 
-        # Drop marker
-        if st.session_state.drop:
-            folium.Marker(
-                st.session_state.drop,
-                tooltip="Drop",
-                icon=folium.Icon(color="red")
-            ).add_to(m)
-        map_placeholder = st.empty()
+    if handle_map_click(data):
+        st.rerun()
+    st.caption("Tip: pinch or scroll to zoom. Tap the map to place your next point.")
 
-        with map_placeholder:
-            map_data = st_folium(
-                m,
-                width="100%",
-                height=500,
-                center=st.session_state.map_center,
-                zoom=st.session_state.map_zoom,
-                key="pickup_map"
-            )
-        
 
-            # Save map position
-        if map_data:
-            if map_data.get("center"):
-                st.session_state.map_center = [
-                    map_data["center"]["lat"],
-                    map_data["center"]["lng"]
-                ]
+def pricing_period(hour: int):
+    if fl.is_peak_hour(hour):
+        return "Rush-hour rates", "Higher demand period"
+    if fl.is_night_hour(hour):
+        return "Night rates", "Night surcharge may apply"
+    return "Standard rates", "Regular demand"
 
-            if map_data.get("zoom"):
-                st.session_state.map_zoom = map_data["zoom"]
 
-        # Process only real map clicks
-        clicked = map_data.get("last_clicked") if map_data else None
+def render_poi(p: dict) -> None:
+    c1, c2 = st.columns([6, 1])
+    meta = (f"About {p['minutes_into_trip']} min into the trip (≈ {p['pass_time']:%I:%M %p}) · "
+            f"{p['off_route_m']} m from your route")
+    if p["opening_hours"]:
+        meta += f" · Hours: {p['opening_hours']}"
+    c1.markdown(ui.poi_row(p["name"], p["cuisine"], meta), unsafe_allow_html=True)
+    stops_full = None not in st.session_state.stops and len(st.session_state.stops) >= MAX_STOPS
+    c2.button("＋ Stop", key=f"stop_{p['category']}_{p['id']}", on_click=add_poi_as_stop,
+              args=(p["lat"], p["lon"], p["name"]), disabled=stops_full, help="Add this place as a stop on your route")
 
-        if clicked is not None:
 
-            lat = clicked["lat"]
-            lon = clicked["lng"]
+def render_suggestions(cfg: dict, ranked: dict, poi_error, route_res: dict) -> None:
+    st.markdown(ui.section_title("Along your route", "Food, shopping and sights near your journey"), unsafe_allow_html=True)
+    if not cfg["show_suggestions"]:
+        st.caption("Suggestions are switched off. Turn them on under Preferences.")
+        return
+    if not cfg["categories"]:
+        st.info("Choose at least one category under Preferences.")
+        return
+    if not route_res["success"]:
+        st.info("Suggestions need a live driving route, which isn't available right now.")
+        return
+    if poi_error:
+        st.warning("We couldn't load nearby places right now. Please try again in a minute.")
+        return
+    emoji, headline, order = poi_service.meal_context(cfg["trip_dt"].hour)
+    categories = [c for c in order if ranked.get(c)]
+    if not categories:
+        st.info(f"No named places found within {cfg['radius']} m of this route. Try a larger distance under Preferences.")
+        return
+    st.info(f"{emoji} **{headline}** — here is what you will pass on the way.")
+    for tab, cat in zip(st.tabs([poi_service.CATEGORY_LABELS[c] for c in categories]), categories):
+        with tab:
+            for p in ranked[cat]:
+                render_poi(p)
+    st.caption("Places are listed from OpenStreetMap, which has no ratings or crowd data. They are ordered by how "
+               "well-known and how close they are to your route. Opening hours may be missing or out of date.")
 
-            location = geolocator.reverse((lat, lon), language="en")
-            address = location.address if location else "Unknown Location"
 
-    # KEEP your existing pickup / stop / drop logic here
-
-            # 1️⃣ Pickup
-            if st.session_state.pickup is None:
-                st.session_state.pickup = (lat, lon)
-                st.session_state.pickup_address = address
-
-            # 2️⃣ Stop
-            elif st.session_state.adding_stop:
-                idx = st.session_state.stops.index(None)
-                st.session_state.stops[idx] = (lat, lon)
-                st.session_state.stop_addresses[idx] = address
-                st.session_state.adding_stop = False
-
-            # 3️⃣ Drop
-            elif st.session_state.drop is None:
-                st.session_state.drop = (lat, lon)
-                st.session_state.drop_address = address
-
-            # 4️⃣ New Trip
-            else:
-                st.session_state.pickup = (lat, lon)
-                st.session_state.pickup_address = address
-                st.session_state.drop = None
-                st.session_state.drop_address = ""
-                st.session_state.stops = []
-                st.session_state.stop_addresses = []
-                st.session_state.adding_stop = False
-
-            st.rerun()
-
-        # ---------------- Pickup ----------------
-        if st.session_state.pickup:
-            p_lat, p_lon = st.session_state.pickup
-            st.success("🟢 Pickup")
-            st.write(st.session_state.pickup_address)
-
-        # ---------------- Stops ----------------
-        for i, stop in enumerate(st.session_state.stops):
-            if stop:
-                st.warning(f"🟠 Stop {i+1}")
-                st.write(st.session_state.stop_addresses[i])
-
-        # ---------------- Drop ----------------
-        if st.session_state.drop:
-            d_lat, d_lon = st.session_state.drop
-            st.error("🔴 Drop")
-            st.write(st.session_state.drop_address)
-        # ==========================================
-        # ROUTE ORDER (OLA / UBER STYLE)
-        # ==========================================
-
-        st.markdown("### 🛣️ Route Order")
-
-        route_points = []
-
-        if st.session_state.pickup_address:
-            route_points.append(f"🟢 Pickup: {st.session_state.pickup_address}")
-
-        for i, address in enumerate(st.session_state.stop_addresses):
-            if address:
-                route_points.append(f"🟠 Stop {i+1}: {address}")
-
-        if st.session_state.drop_address:
-            route_points.append(f"🔴 Drop: {st.session_state.drop_address}")
-
-        for point in route_points:
-            st.markdown(point)
-
-        if st.button("🗑 Clear Trip"):
-            st.session_state.pickup = None
-            st.session_state.drop = None
-            st.session_state.pickup_address = ""
-            st.session_state.drop_address = ""
-            st.session_state.stops = []
-            st.session_state.stop_addresses = []
-            st.rerun()
-    # --------------------------------------------------
-    # Fetch Route from OSRM
-    # --------------------------------------------------
-    with st.spinner("Fetching shortest driving path from OSRM..."):
-        route_res = route_engine.get_osrm_route(
-            p_lat,
-            p_lon,
-            d_lat,
-            d_lon,
-            stops=st.session_state.stops
-        )
-
-    route_dist_km = route_res["distance_km"]
-    route_dur_min = route_res["duration_min"]
-    path_coords = route_res["path_coordinates"]
-    # =====================================================
-    # AUTOMATIC LIVE TRAFFIC CALCULATION
-    # =====================================================
-
-    traffic_level, traffic_multiplier = calculate_traffic_level(
-        p_lat,
-        p_lon,
-        d_lat,
-        d_lon,
-        hour,
-        weather_flag
-    )
-
-    # Save original ETA
-    base_duration = route_dur_min
-
-    # Apply automatic traffic multiplier
-    route_dur_min = round(base_duration * traffic_multiplier, 1)
-
-    # --------------------------------------------------
-    # Main View: Map & Summary Columns
-    # --------------------------------------------------
-    col_map, col_info = st.columns([3, 2])
-
-    with col_map:
-        st.subheader("🗺️ Mumbai Interactive Route Map")
-        st.caption(f"Routing: {route_res['provider']} | {route_res['algorithm']}")
-
-        # Center map
-        mid_lat = (p_lat + d_lat) / 2
-        mid_lon = (p_lon + d_lon) / 2
-
-        route_map = folium.Map(
-            location=[mid_lat, mid_lon],
-            zoom_start=12,
-            tiles="OpenStreetMap"
-        )
-
-        # Pickup marker
-        folium.Marker(
-            [p_lat, p_lon],
-            popup=st.session_state.pickup_address,
-            tooltip="🟢 Pickup",
-            icon=folium.Icon(color="green", icon="play")
-        ).add_to(route_map)
-        # ==========================================
-        # STOP MARKERS
-        # ==========================================
-
-        for i, stop in enumerate(st.session_state.stops):
-            if stop:
-                folium.Marker(
-                    [stop[0], stop[1]],
-                    popup=f"Stop {i+1}",
-                    tooltip=st.session_state.stop_addresses[i],
-                    icon=folium.Icon(color="orange", icon="flag")
-                ).add_to(route_map)
-
-        # Drop marker
-        folium.Marker(
-            [d_lat, d_lon],
-            popup=st.session_state.drop_address,
-            tooltip="🔴 Drop",
-            icon=folium.Icon(color="red", icon="stop")
-        ).add_to(route_map)
-
-       
-        # =====================================================
-        # TRAFFIC COLOURED ROUTE
-        # =====================================================
-
-        route_color = {
-            "Low": "#16A34A",        # Green
-            "Moderate": "#F59E0B",   # Orange
-            "Heavy": "#DC2626"       # Red
-        }[traffic_level]
-
-        folium.PolyLine(
-            locations=path_coords,
-            color=route_color,
-            weight=7,
-            opacity=0.9
-        ).add_to(route_map)
-
-        st_folium(
-            route_map,
-            width="100%",
-            height=500,
-            key="route_display_map"
-        )
-        # =====================================================
-        # TRAFFIC LEGEND
-        # =====================================================
-
-        st.markdown("#### 🚦 Traffic Legend")
-
-        lg1, lg2, lg3 = st.columns(3)
-
-        with lg1:
-            st.success("🟢 Low")
-
-        with lg2:
-            st.warning("🟠 Moderate")
-
-        with lg3:
-            st.error("🔴 Heavy")
-        st.markdown("### 📍 Selected Locations")
-
-        c1, c2 = st.columns(2)
-
-        with c1:
-            st.success("🟢 Pickup")
-            st.write(st.session_state.pickup_address)
-
-        with c2:
-            st.error("🔴 Drop")
-            st.write(st.session_state.drop_address)
-
-    with col_info:
-        st.subheader("🎯 Trip Summary & ML Fare")
-        
-        # Calculate Model Prediction
-        if model is not None:
-            features = np.array([[ 
-                p_lat, p_lon, d_lat, d_lon, 
-                passengers, route_dist_km, route_dur_min, 
-                hour, day_of_week, weather_flag 
-            ]])
-            model_pred_fare = model.predict(features)[0]
-            model_pred_fare = max(model_pred_fare, 28.0)
-            
-            # Apply vehicle category adjustment
-            veh_mult = {"Auto Rickshaw": 0.85, "Kaali-Peeli Taxi": 0.95, "Hatchback / Sedan": 1.0, "SUV Prime": 1.45}
-            final_model_fare = model_pred_fare * veh_mult[vehicle_type]
+def render_results(q: dict, cfg: dict, weather: dict, route_res: dict, ranked: dict, poi_error) -> None:
+    ss = st.session_state
+    trip_dt = cfg["trip_dt"]
+    st.markdown(ui.section_title("Ride options", f"Estimated fares for {cfg['vehicle_label'].split(' ', 1)[1]} · "
+                                                  f"{tm.format_trip_time(trip_dt)}"), unsafe_allow_html=True)
+    available = {k: v for k, v in q["fares"].items() if v is not None}
+    cheapest = min(available, key=available.get) if available else None
+    cards = [ui.ride_card("🧭", f"{APP_NAME} Estimate", "Typical market fare", q["estimate"], "Benchmark", estimate=True)]
+    for key in fl.PLATFORM_KEYS:
+        icon, name = PROVIDERS[key]
+        price = q["fares"][key]
+        if price is None:
+            cards.append(ui.ride_card(icon, name, cfg["vehicle_label"].split(" ", 1)[1], None,
+                                      f"Not offered for {cfg['vehicle_label'].split(' ', 1)[1]}"))
         else:
-            final_model_fare = 28.0 + route_dist_km * 18.5
+            cards.append(ui.ride_card(icon, name, cfg["vehicle_label"].split(" ", 1)[1], price,
+                                      "Lowest fare" if key == cheapest else "Estimated fare", best=key == cheapest))
+    if cheapest:
+        saving = max(available.values()) - available[cheapest]
+        st.markdown(ui.savings_banner(PROVIDERS[cheapest][1], available[cheapest], saving), unsafe_allow_html=True)
+    st.markdown(ui.rides_grid(cards), unsafe_allow_html=True)
 
-        # Display Fare Card
-        st.markdown(f"""
-        <div class="fare-card">
-            <div class="fare-label">Predicted Model Fare ({vehicle_type})</div>
-            <div class="fare-amount">₹{round(final_model_fare)}</div>
-            <div style="font-size:13px; opacity:0.85; margin-top:4px;">
-                Distance: <b>{route_dist_km} km</b> • Est. Duration: <b>{route_dur_min} mins</b>
-            </div>
-        </div>
-        """, unsafe_allow_html=True)
-        # =====================================================
-        # AUTOMATIC LIVE TRAFFIC STATUS
-        # =====================================================
+    s1, s2 = st.columns([1, 3])
+    if s1.button("💾 Save this trip", type="primary", key="save_trip"):
+        stop_labels = [a for s, a in zip(ss.stops, ss.stop_addresses) if s is not None]
+        info = weather["info"]
+        weather_label = fl.WEATHER_LABELS[weather["flag"]]
+        if info:
+            weather_label += f" ({info['description']}, {info['precipitation_mm']} mm/h)"
+        r = lambda v: None if v is None else round(v)  # noqa: E731
+        save_booking(
+            pickup=ss.pickup_address, dropoff=ss.drop_address, stops=", ".join(stop_labels),
+            distance=q["distance_km"], duration=q["duration_min"], traffic=q["traffic"], weather=weather_label,
+            ola=r(q["fares"]["ola_mini"]), uber=r(q["fares"]["uber_go"]),
+            rapido=r(q["fares"]["rapido_bike_cab"]), kp=r(q["fares"]["mumbai_kaali_peeli"]),
+            ml=q["estimate"], vehicle_type=cfg["vehicle_type"], session_id=ss.session_id,
+            trip_time=trip_dt.isoformat(timespec="minutes"),
+        )
+        s2.success("Trip saved - find it under **My trips**.")
 
-        st.markdown("### 🚦 Live Traffic Status")
+    # ---- trip summary
+    st.markdown(ui.section_title("Trip summary"), unsafe_allow_html=True)
+    period, period_sub = pricing_period(trip_dt.hour)
+    st.markdown(ui.tiles_row([
+        ui.tile("📏", "Distance", f"{q['distance_km']:g} km", "Driving route"),
+        ui.tile("⏱️", "Travel time", f"{round(q['duration_min'])} min", f"Arrive by {q['arrival']:%I:%M %p}"),
+        ui.tile("🚦", "Traffic", q["traffic"], "Estimated for your time"),
+        ui.tile("🏷️", "Pricing", period, period_sub),
+    ]), unsafe_allow_html=True)
 
-        if traffic_level == "Low":
-            st.success(f"🟢 Low Traffic • ETA: {route_dur_min} min")
-
-        elif traffic_level == "Moderate":
-            st.warning(f"🟠 Moderate Traffic • ETA: {route_dur_min} min")
-
-        else:
-            st.error(f"🔴 Heavy Traffic • ETA: {route_dur_min} min")
-        
-        st.write("")
-        st.markdown("##### ⏱️ Peak & Weather Pricing Factors")
-        if 8 <= hour <= 11 or 17 <= hour <= 21:
-            st.warning(f"🚦 Rush Hour Surge Active ({hour}:00 hrs)")
-        elif 23 <= hour or hour <= 5:
-            st.info(f"🌙 Night Time Rate Active (+25% RTO rule)")
-        else:
-            st.success(f"☀️ Normal Pricing Window ({hour}:00 hrs)")
-
-        if weather_flag > 0:
-            st.warning(f"🌧️ Monsoon Rain Multiplier Applied")
+    # ---- conditions
+    st.markdown(ui.section_title("Weather & conditions", "Used to estimate fares for your trip time"), unsafe_allow_html=True)
+    info = weather["info"]
+    when_text = "Scheduled trip" if cfg["scheduled"] else "Leaving now"
+    tiles = [ui.tile("🗓️", "Trip time", f"{trip_dt:%I:%M %p}", f"{trip_dt:%a %d %b} · {when_text}")]
+    if info:
+        temp = "–" if info["temperature_c"] is None else f"{info['temperature_c']:.0f}°C"
+        feels = f"Feels like {info['feels_like_c']:.0f}°C" if info["feels_like_c"] is not None else ""
+        tiles.append(ui.tile(info["icon"], "Weather", f"{temp} · {info['description']}", feels))
+        tiles.append(ui.tile("🌧️", "Rain", f"{info['precipitation_mm']:g} mm/h",
+                             "Rain pricing applies" if weather["flag"] else "No rain expected"))
+        wind = "–" if info["wind_kmh"] is None else f"{info['wind_kmh']:.0f} km/h"
+        humidity = f"Humidity {info['humidity_pct']:.0f}%" if info["humidity_pct"] is not None else ""
+        tiles.append(ui.tile("💨", "Wind", wind, humidity))
+    else:
+        tiles.append(ui.tile(weather["icon"], "Weather", weather["desc"], "Set manually"))
+    st.markdown(ui.tiles_row(tiles), unsafe_allow_html=True)
+    if weather["failed"]:
+        st.warning("We couldn't fetch the live weather, so we used clear-weather pricing. "
+                   "You can set the weather under Preferences.")
+    if info and info.get("outlook"):
+        st.markdown(ui.label("Next few hours"), unsafe_allow_html=True)
+        st.markdown(ui.outlook_strip(info["outlook"]), unsafe_allow_html=True)
 
     st.divider()
+    render_suggestions(cfg, ranked, poi_error, route_res)
 
-    # --------------------------------------------------
-    # Platform Fare Comparison Grid
-    # --------------------------------------------------
-    st.subheader("📊 Platform Fare Comparison Engine (Academic Estimates)")
-    st.caption("Side-by-side estimated fare bands comparing our ML model with Mumbai ride-hailing platforms using standard tariff rules.")
 
-    # Calculate platform estimates
-    is_peak = (8 <= hour <= 11 or 17 <= hour <= 21)
-    is_night = (23 <= hour or hour <= 5)
-    
-    surge_mult = 1.25 if is_peak else (1.10 if is_night else 1.0)
-    w_mult = 1.0 if weather_flag == 0 else (1.15 if weather_flag == 1 else 1.30)
+def render_trips() -> None:
+    st.markdown(ui.section_title("My trips", "Trips you saved in this session"), unsafe_allow_html=True)
+    trips = get_bookings(session_id=st.session_state.session_id)
+    if trips.empty:
+        st.info("You haven't saved any trips yet. Plan a ride and choose **Save this trip**.")
+        return
+    shown = trips[[c for c in TRIP_COLUMNS if c in trips.columns]].rename(columns=TRIP_COLUMNS)
+    st.dataframe(shown, hide_index=True)
+    st.download_button("⬇️ Download trips (CSV)", shown.to_csv(index=False).encode("utf-8"),
+                       file_name="my_trips.csv", mime="text/csv")
 
-    # Ola Calculation
-    ola_cfg = platform_config.get("platforms", {}).get("ola_mini", {})
-    ola_fare = max(ola_cfg.get("base_fare", 35) + route_dist_km * ola_cfg.get("per_km_rate", 18) + route_dur_min * ola_cfg.get("per_min_rate", 1.8), ola_cfg.get("minimum_fare", 50)) * surge_mult * w_mult
 
-    # Uber Calculation
-    uber_cfg = platform_config.get("platforms", {}).get("uber_go", {})
-    uber_fare = max(uber_cfg.get("base_fare", 38) + route_dist_km * uber_cfg.get("per_km_rate", 19.5) + route_dur_min * uber_cfg.get("per_min_rate", 2.0), uber_cfg.get("minimum_fare", 55)) * surge_mult * w_mult
+def render_performance() -> None:
+    m = load_metrics()
+    st.markdown(ui.section_title("Fare estimator performance",
+                                 "How closely the estimator reproduces fares on trips it has never seen"),
+                unsafe_allow_html=True)
+    if not m:
+        st.info("Performance data isn't available yet. Run `python train_mumbai_model.py` to generate it.")
+        return
 
-    # Rapido Calculation
-    rapido_cfg = platform_config.get("platforms", {}).get("rapido_bike_cab", {})
-    rapido_fare = max(rapido_cfg.get("base_fare", 20) + route_dist_km * rapido_cfg.get("per_km_rate", 12) + route_dur_min * rapido_cfg.get("per_min_rate", 1.0), rapido_cfg.get("minimum_fare", 25)) * surge_mult * w_mult
+    st.markdown(ui.tiles_row([
+        ui.tile("🎯", "R² score", f"{m['r2_score']:.4f}", "1.0 = perfect fit"),
+        ui.tile("💰", "Average error (MAE)", f"₹{m['mae']:g}", f"{m.get('mape_pct', '–')}% of the fare"),
+        ui.tile("📉", "RMSE", f"₹{m['rmse']:g}", "Penalises large misses"),
+        ui.tile("🗂️", "Trips analysed", f"{m['dataset_records']:,}", "Simulated Mumbai trips"),
+    ]), unsafe_allow_html=True)
+    st.info("**How to read this:** scores are measured on "
+            f"{m.get('data_source', 'simulated')} trips the estimator was not trained on "
+            f"({m.get('evaluation', 'held-out routes')}). They show how well it reproduces the fare rules, "
+            "not how close it is to real receipts.")
 
-    # Kaali-Peeli Meter Fare
-    kp_cfg = platform_config.get("platforms", {}).get("mumbai_kaali_peeli", {})
-    kp_fare = max(kp_cfg.get("base_fare", 28) + (max(route_dist_km - 1.5, 0)) * kp_cfg.get("per_km_rate", 18.66), 28.0)
-    if is_night:
-        kp_fare *= 1.25 # 25% night charge rule
-
-    c1, c2, c3, c4, c5 = st.columns(5)
-
+    c1, c2 = st.columns(2)
+    plot, importance = BASE_DIR / "actual_vs_predicted.png", BASE_DIR / "feature_importance.png"
     with c1:
-        st.markdown(f"""
-        <div class="platform-card" style="border-color:#0284c7; background:#0c4a6e;">
-            <div class="platform-name">🎯 Our Model</div>
-            <div class="platform-price">₹{round(final_model_fare)}</div>
-            <span class="badge-tag">ML Prediction</span>
-        </div>
-        """, unsafe_allow_html=True)
-
+        st.markdown(ui.section_title("Actual vs predicted fare", "Points on the dashed line are perfect predictions"),
+                    unsafe_allow_html=True)
+        if plot.exists():
+            st.image(str(plot))
+        else:
+            st.warning("Graph not found. Run `python train_mumbai_model.py`.")
     with c2:
-        st.markdown(f"""
-        <div class="platform-card">
-            <div class="platform-name">🟡 Ola Mini</div>
-            <div class="platform-price">₹{round(ola_fare)}</div>
-            <span class="badge-tag">Est. Band</span>
-        </div>
-        """, unsafe_allow_html=True)
+        st.markdown(ui.section_title("What adjusts the fare", "Importance of each input in adjusting the base distance-and-time fare (rain, rush hour, night…)"),
+                    unsafe_allow_html=True)
+        if importance.exists():
+            st.image(str(importance))
+        else:
+            st.warning("Graph not found. Run `python train_mumbai_model.py`.")
 
-    with c3:
-        st.markdown(f"""
-        <div class="platform-card">
-            <div class="platform-name">⬛ Uber Go</div>
-            <div class="platform-price">₹{round(uber_fare)}</div>
-            <span class="badge-tag">Est. Band</span>
-        </div>
-        """, unsafe_allow_html=True)
-
-    with c4:
-        st.markdown(f"""
-        <div class="platform-card">
-            <div class="platform-name">🛵 Rapido Auto/Bike</div>
-            <div class="platform-price">₹{round(rapido_fare)}</div>
-            <span class="badge-tag">Budget Option</span>
-        </div>
-        """, unsafe_allow_html=True)
-
-    with c5:
-        st.markdown(f"""
-        <div class="platform-card">
-            <div class="platform-name">🚕 Kaali-Peeli</div>
-            <div class="platform-price">₹{round(kp_fare)}</div>
-            <span class="badge-tag">RTO Meter Rate</span>
-        </div>
-        """, unsafe_allow_html=True)
-    st.divider()
-
-if st.button("🚖 Confirm & Save Booking", use_container_width=True):
-
-    save_booking(
-        pickup=st.session_state.pickup_address,
-        dropoff=st.session_state.drop_address,
-        stops=", ".join([s for s in st.session_state.stop_addresses if s]),
-        distance=route_dist_km,
-        duration=route_dur_min,
-        traffic=traffic_level,
-        weather=weather_desc,
-        ola=round(ola_fare),
-        uber=round(uber_fare),
-        rapido=round(rapido_fare),
-        kp=round(kp_fare),
-        ml=round(final_model_fare)
-    )
-
-    st.success("✅ Booking saved successfully in SQLite!")
-
-    # Bar chart breakdown
-    st.write("")
-    fare_chart_df = pd.DataFrame({
-        "Platform / Option": ["Our Model", "Ola Mini", "Uber Go", "Rapido", "Kaali-Peeli Meter"],
-        "Estimated Fare (₹)": [round(final_model_fare), round(ola_fare), round(uber_fare), round(rapido_fare), round(kp_fare)]
-    })
-    st.bar_chart(fare_chart_df.set_index("Platform / Option"))
+    st.markdown(ui.section_title("Details"), unsafe_allow_html=True)
+    d1, d2 = st.columns(2)
+    with d1:
+        lin = m.get("linear_baseline")
+        rows = [("Estimator", m.get("model_name", "–")), ("Trees / max depth", f"{m.get('n_estimators', '–')} / {m.get('max_depth', '–')}"),
+                ("Inputs", ", ".join(m.get("features", []))),
+                ("Cross-validated error", f"₹{m.get('cv_mae_mean', '–')} ± {m.get('cv_mae_std', '–')}"),
+                ("Last trained", m.get("trained_on", "–"))]
+        if lin:
+            rows.append(("Simple baseline (distance + time only)", f"MAE ₹{lin['mae']} · R² {lin['r2_score']}"))
+        st.dataframe(pd.DataFrame(rows, columns=["Item", "Value"]), hide_index=True)
+    with d2:
+        bands = m.get("mae_by_distance_band", {})
+        if bands:
+            table = pd.DataFrame([{"Trip distance": k, "Average error (₹)": v["mae"], "Error (% of fare)": v["mape_pct"],
+                                   "R²": v["r2_score"]} for k, v in bands.items()])
+            st.dataframe(table, hide_index=True)
 
 
-# --------------------------------------------------
-# TAB 2: Guide Report & Viva Defense
-# --------------------------------------------------
+# --------------------------------------------------------------------------
+# Page
+# --------------------------------------------------------------------------
+nav_slot = st.empty()
+tab_plan, tab_trips, tab_perf = st.tabs(["🚖 Plan a ride", "🧾 My trips", "📊 Performance"])
 
-with tab_report:
-    st.header("📚 College Project Report & Viva Defense Document")
-    st.caption("Complete 8-Point Academic Documentation for Project Guide Evaluation")
+with tab_plan:
+    left, right = st.columns([5, 7], gap="large")
+    with left:
+        cfg = render_planner()
+    weather = resolve_weather(cfg)
 
-    st.markdown("""
-    > [!IMPORTANT]
-    > **Project Title:** Mumbai Smart Cab Fare Prediction & Route Optimization System  
-    > **Architecture:** OpenStreetMap Tiles + OSRM Shortest Path API + Random Forest ML Model + Platform Comparison Engine  
-    """)
+    ss = st.session_state
+    stop_pts = [s for s in ss.stops if s is not None]
+    stop_labels = [a for s, a in zip(ss.stops, ss.stop_addresses) if s is not None]
+    ready = ss.pickup is not None and ss.drop is not None
+    too_close = ready and not stop_pts and fl.haversine_km(*ss.pickup, *ss.drop) < 0.05
 
-    col_r1, col_r2 = st.columns(2)
+    route_res, ranked, poi_error, raw_places = None, {}, None, []
+    with right:
+        if ready and not too_close:
+            with st.spinner("Finding the best route…"):
+                route_res = get_route(route_engine.build_points(ss.pickup, ss.drop, stop_pts))
+            if route_res["warning"]:
+                st.warning("Live routing is unavailable, so distance and time are approximate.")
+            if cfg["show_suggestions"] and cfg["categories"] and route_res["success"]:
+                with st.spinner("Looking for places along your route…"):
+                    raw_places, poi_error = get_pois(route_res["path_coordinates"], cfg["radius"], cfg["categories"])
+        if raw_places and route_res is not None and not poi_error:
+            ranked = poi_service.rank_pois(raw_places, route_res["path_coordinates"],
+                                           route_res["duration_min"], cfg["trip_dt"], per_category=5,
+                                           max_off_route_m=cfg["radius"])
+        render_map(route_res, ranked, stop_pts, stop_labels)
 
-    with col_r1:
-        st.markdown("""
-        ### 1. Problem Statement
-        Predicting cab fares in Mumbai requires accounting for heavy traffic density, monsoon weather variations, rush-hour surge pricing, and RTO regulatory tariffs. Existing generic fare models (such as NYC taxi datasets) fail in Indian metropolitan contexts due to differences in currency, road networks, auto-rickshaw meter regulations, and platform pricing structures (Ola, Uber, Rapido).
+    if too_close:
+        st.warning("Pickup and drop-off are the same place. Please choose two different locations.")
+    elif route_res is not None:
+        quote = compute_quote(route_res, cfg, weather)
+        st.divider()
+        render_results(quote, cfg, weather, route_res, ranked, poi_error)
+    else:
+        st.markdown(ui.section_title("How it works"), unsafe_allow_html=True)
+        st.markdown(ui.how_it_works(), unsafe_allow_html=True)
 
-        ### 2. Why Mumbai Data is Required
-        - **Currency & Scale:** NYC fare models output USD ($) based on grid-based Manhattan blocks. Mumbai operates in INR (₹) with complex coastal and suburban arterial roads.
-        - **Vehicle Ecosystem:** Mumbai features unique transport options including Auto-Rickshaws, Kaali-Peeli Taxis, and ride-hailing cabs.
-        - **Regulatory Tariff:** Mumbai's RTO enforces specific base fares (e.g., ₹28 for Auto/Taxi minimum) and 25% night surcharges between 11 PM and 5 AM.
+with tab_trips:
+    render_trips()
 
-        ### 3. Dataset Schema & Feature Engineering
-        Our system utilizes a customized 5,000-record Mumbai trip dataset containing:
-        - `pickup_latitude` & `pickup_longitude` (Mumbai bounding box: 18.89°N - 19.30°N, 72.75°E - 73.05°E)
-        - `dropoff_latitude` & `dropoff_longitude`
-        - `route_distance_km` (Calculated via OSRM / Haversine)
-        - `route_duration_min` (Traffic-adjusted travel time)
-        - `pickup_hour` (0-23) & `day_of_week` (0-6)
-        - `weather_flag` (Clear, Monsoon Rain, Heavy Torrential Rain)
-        - `fare_amount` (Target feature in INR ₹)
-        """)
+with tab_perf:
+    render_performance()
 
-    with col_r2:
-        st.markdown(f"""
-        ### 4. Machine Learning Model Performance
-        - **Algorithm:** `RandomForestRegressor` (100 Decision Trees, Max Depth 15)
-        - **R² Score:** `{metrics_info.get('r2_score', 0.9954)}` (High variance explanation)
-        - **Mean Absolute Error (MAE):** `₹{metrics_info.get('mae', 9.68)}`
-        - **Root Mean Squared Error (RMSE):** `₹{metrics_info.get('rmse', 19.28)}`
-
-        ### 5. Shortest Route & Routing Engine (OSRM)
-        Instead of using direct straight-line distance, the app connects to the **Open Source Routing Machine (OSRM)** API.
-        - **Production Algorithm:** Multi-Level Dijkstra (MLD) / Contraction Hierarchies (CH).
-        - **Comparison for Viva:**
-          - *Dijkstra:* Baseline search exploring nodes uniformly.
-          - *A\* Search:* Spatial heuristic search directing search toward goal.
-          - *OSRM MLD:* Preprocessed hierarchical routing offering sub-millisecond query speed on OpenStreetMap networks.
-
-        ### 6. Platform Comparison Engine (Ola / Uber / Rapido)
-        To avoid depending on expensive paid platform APIs, the system implements a rule-based comparison engine loaded from `platform_fares.json`. It computes estimates using base fares, per-km rates, per-minute rates, and surge multipliers.
-        """)
-
-    st.divider()
-
-    st.subheader("💡 Viva Voce FAQ & Defense Guide")
-    
-    faq1, faq2, faq3 = st.columns(3)
-    
-    with faq1:
-        st.markdown("""
-        **Q1: Why is your ML model accurate?**  
-        *Answer:* The model is trained on non-linear features including exact OSRM road distance, traffic-dependent duration, rush-hour time slots, and weather flags using Random Forest ensemble trees.
-        """)
-        
-    with faq2:
-        st.markdown("""
-        **Q2: How do you compare with Ola/Uber without paid APIs?**  
-        *Answer:* We built an open rule-based simulation engine using publicly documented fare structures (Base Fare + Rate/KM + Rate/Min + Surge) stored in `platform_fares.json`.
-        """)
-
-    with faq3:
-        st.markdown("""
-        **Q3: What makes this free-tier friendly?**  
-        *Answer:* OpenStreetMap provides free map tiles, OSRM provides free routing queries, Scikit-Learn runs locally, and Streamlit hosts the dashboard without any API charges.
-        """)
-st.divider()
-
-st.subheader("🗄 SQLite Booking Database")
-
-db = get_all_bookings()
-
-if db.empty:
-    st.info("No bookings available.")
-else:
-    st.success(f"Total Bookings: {len(db)}")
-
-    st.dataframe(
-        db,
-        use_container_width=True,
-        hide_index=True
-    )
+chips = [f"📍 {CITY}", f"🕒 {tm.format_trip_time(cfg['trip_dt'])}"]
+winfo = weather["info"]
+chips.append(f"{weather['icon']} " + (f"{winfo['temperature_c']:.0f}°C · {weather['desc']}"
+                                     if winfo and winfo["temperature_c"] is not None else weather["desc"]))
+nav_slot.markdown(ui.navbar(chips), unsafe_allow_html=True)
+st.markdown(ui.footer(), unsafe_allow_html=True)

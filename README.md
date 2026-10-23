@@ -1,73 +1,67 @@
-<<<<<<< HEAD
-# 🚕 Mumbai Smart Cab Fare Prediction & Route Optimization System
+# 🚕 FareCompass - Compare cab fares across Mumbai
 
-An advanced Machine Learning and Geospatial Routing system that predicts cab fares across Mumbai, finds shortest driving routes via **OSRM (Open Source Routing Machine)** on **OpenStreetMap**, and compares estimated fares across **Ola**, **Uber**, **Rapido**, and **RTO Kaali-Peeli meter rates**.
+FareCompass is a Streamlit web app that lets riders tap a map to set their route, then compares estimated fares for
+auto, taxi, sedan and SUV across Ola, Uber, Rapido and the Kaali-Peeli meter - with live weather, advance booking and
+suggestions for food, shopping and sights along the way.
 
----
+> **Before a public launch:** fares are *estimates* produced by transparent pricing rules in `platform_fares.json`
+> (editable) and a fare estimator trained on **simulated** trips. The platform prices are not live or official, and the
+> estimator has not been validated against real receipts. The app says "estimates only / not affiliated with Ola, Uber or
+> Rapido" in its footer - keep that, validate with real fares, and run a trademark/domain check on the brand name
+> (set in `branding.py`) before launching.
 
-## 📌 Features & Key Modules
+## What users can do
+- **Tap the map** (opens straight away) to set pickup, optional stops and drop-off - or search for a place by name.
+- **Compare ride options** for Auto / Taxi / Sedan / SUV; the lowest fare is highlighted and unavailable options say so.
+- **Leave now or schedule** a trip up to 7 days ahead; weather, traffic and rush-hour/night pricing follow that time.
+- **See conditions:** automatic weather (temperature, rain, wind, humidity, next-hours outlook), traffic estimate, arrival time.
+- **Discover places on the way:** restaurants, cafés, malls and attractions near the route, timed to the trip, with one-click "＋ Stop".
+- **Save trips** and download them from *My trips*.
+- **Performance tab:** R² score, average error, actual-vs-predicted graph and feature importance for the fare estimator (measured on simulated trips, grouped by unseen route areas).
 
-- 📍 **Mumbai-Specific Dataset & Model:** Trained on 5,000 Mumbai trips with INR (₹) fares, Mumbai coordinates (18.89°N - 19.30°N, 72.75°E - 73.05°E), RTO minimum tariffs, and weather/traffic multipliers.
-- 🗺️ **OSRM Shortest Driving Route Integration:** Connects to OSRM driving route API for real road paths, exact road distance (KM), and traffic-adjusted travel duration (Mins).
-- 🎨 **Multi-Provider Interactive Map:** Select between OpenStreetMap Standard, CartoDB Positron, CartoDB Dark Matter, and Esri World Street Map tiles powered by PyDeck.
-- 📊 **Multi-Platform Fare Comparison Engine:** Side-by-side estimated price comparison cards and bar charts comparing:
-  - 🎯 **Our Random Forest ML Model Prediction**
-  - 🟡 **Ola Mini / Go**
-  - ⬛ **Uber Go**
-  - 🛵 **Rapido Bike / Auto**
-  - 🚕 **Official RTO Kaali-Peeli Meter Fare**
-- 📚 **College Project Guide & Viva Documentation Tab:** Embedded 8-point academic report & FAQ answers explaining model accuracy, dataset engineering, Dijkstra vs. A* vs. OSRM Multi-Level Dijkstra routing algorithms.
-
----
-
-## 📂 Project Structure
-
+## Project structure
 ```
-NYC-Smart-Cab-Fare-Prediction/
-├── train_mumbai_model.py     # Script to generate Mumbai dataset & train ML model
-├── mumbai_cab_fare_train.csv  # 5,000 record Mumbai cab trip dataset (in ₹)
-├── mumbai_cab_fare_model.pkl  # Trained Random Forest Regressor model file
-├── mumbai_model_metrics.json  # Model evaluation metrics (MAE, RMSE, R² Score)
-├── route_engine.py           # OSRM API integration client & routing algorithm analyzer
-├── platform_fares.json       # Configurable pricing rules for Ola, Uber, Rapido
-├── mumbai_app.py             # Streamlit interactive web application dashboard
-├── CFP.py                    # Legacy NYC app script
-├── requirements.txt          # Python dependencies
-└── README.md                 # Project documentation
+app.py                    Streamlit interface
+branding.py               Name, tagline and brand colours (change here to rebrand)
+ui_components.py          HTML/CSS building blocks (all external text is escaped)
+.streamlit/config.toml    Light theme + navy primary colour
+fare_logic.py             Pricing rules, traffic estimate, fare estimator wrapper (shared with training)
+platform_fares.json       Editable platform rates, surge, rain and vehicle multipliers
+route_engine.py           OSRM routing + clearly flagged fallback
+geo_utils.py              Rate-limited, Mumbai-bounded place search (Nominatim)
+weather_service.py        Open-Meteo weather -> pricing flag + display data
+trip_time.py              Current India time + advance-booking validation
+poi_service.py            Places along the route (Overpass / OpenStreetMap) + ranking
+database.py               SQLite trip log (parameterised, auto-migrating, per-session)
+train_mumbai_model.py     Rebuilds the simulated dataset and the fare estimator (optional)
+tests/                    Unit tests
 ```
 
----
-
-## ▶️ How To Run
-
-### 1️⃣ Train the Model (Optional / Pre-built)
+## Run it
 ```bash
-python train_mumbai_model.py
+pip install -r requirements.txt
+streamlit run app.py
+python -m unittest discover -s tests -v      # tests
+python train_mumbai_model.py                 # optional: rebuild the fare estimator
 ```
+Optional environment variables: `MAP_TILE_URL`, `MAP_TILE_ATTR`, `OSRM_BASE_URL`, `FARE_DB_PATH`, `NOMINATIM_USER_AGENT`.
 
-### 2️⃣ Run the Streamlit Application
-```bash
-streamlit run mumbai_app.py
-```
+## Services used (all free, no API keys)
+| Purpose | Service | Notes |
+|---|---|---|
+| Map tiles | OpenStreetMap standard tiles | no key needed; light use only - for production set `MAP_TILE_URL` / `MAP_TILE_ATTR` to a licensed provider (MapTiler, Stadia, Mapbox) or self-host |
+| Routing | OSRM demo server | light use only - self-host OSRM for production |
+| Place search | Nominatim | max 1 request/second (handled) |
+| Weather | Open-Meteo | non-commercial use; hourly forecast up to a week ahead |
+| Places on the way | Overpass API | public servers can be busy; app falls back to a mirror |
 
----
+## Known limitations
+- Place suggestions come from OpenStreetMap, which has no ratings or crowd data; hours may be missing or outdated.
+- Weather is read at the pickup point for the trip hour (not along the whole route).
+- Verify the Kaali-Peeli tariff and the night-surcharge window (`fare_logic.NIGHT_START_HOUR/NIGHT_END_HOUR`).
+- Vehicle multipliers in `platform_fares.json` are assumptions.
+- "Save this trip" logs a comparison; it does not book a cab.
+- Saved trips are stored per browser session in a local SQLite file; add accounts before multi-user production use.
 
-## 🧠 Technical Stack & Free-Tier Architecture
-
-- **Frontend / Dashboard:** Streamlit, PyDeck, Pandas, NumPy
-- **Routing Engine:** Open Source Routing Machine (OSRM API) over OpenStreetMap data
-- **Machine Learning:** Scikit-Learn (Random Forest Regressor), Joblib
-- **Map Tiles:** OpenStreetMap, CartoDB, Esri (100% Free Tier, No Paid API Keys required)
-
----
-
-## 🎓 Academic Guide Reporting Points
-
-1. **Problem Statement:** Mumbai-specific cab fare prediction & platform comparison.
-2. **Why Mumbai Data:** Replaced NYC grid/USD system with Mumbai RTO regulations (₹28 base), monsoon multipliers, and suburban arterial road networks.
-3. **Shortest Route Logic:** OSRM Multi-Level Dijkstra (MLD) / Contraction Hierarchies (CH) vs. conceptual Dijkstra & A* algorithms.
-4. **Platform Comparison:** Rule-based calculation from `platform_fares.json` allowing offline/free platform comparisons without live web scraping risks.
-=======
-# fare-price-pridiction
-building a project of fair price pridiction using stramlit and others
->>>>>>> 27839d28874e23ed9315fd3d30c64f241c852f54
+## License
+MIT - see `LICENSE`.

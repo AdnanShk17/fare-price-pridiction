@@ -1,156 +1,253 @@
+"""Generate the simulated Mumbai trip dataset and train the fare model.
+
+IMPORTANT: the dataset is SIMULATED. Fares are produced by the pricing rules in
+`fare_logic.py` / `platform_fares.json` (plus noise); no real trip records are
+used. Metrics therefore measure how well the model learns those rules, not how
+close it is to real-world Ola/Uber/taxi prices.
+
+Usage:  python train_mumbai_model.py
+"""
+from __future__ import annotations
+
+import json
+import sys
+from datetime import date
+from pathlib import Path
+
+import joblib
+import matplotlib
+
+matplotlib.use("Agg")  # never block on plt.show(); just write the PNGs
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from math import radians, sin, cos, sqrt, atan2
+import sklearn
 from sklearn.ensemble import RandomForestRegressor
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_error
-import joblib
-import json
-import os
+from sklearn.linear_model import LinearRegression
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.model_selection import GroupKFold, GroupShuffleSplit
 
-print("--- Starting Mumbai Cab Fare Dataset & Model Training Pipeline ---")
+import fare_logic as fl
 
-# 1. Haversine distance function (in km)
-def haversine(lat1, lon1, lat2, lon2):
-    R = 6371.0
-    lat1, lon1, lat2, lon2 = map(radians, [lat1, lon1, lat2, lon2])
-    dlat = lat2 - lat1
-    dlon = lon2 - lon1
-    a = sin(dlat/2)**2 + cos(lat1)*cos(lat2)*sin(dlon/2)**2
-    c = 2 * atan2(sqrt(a), sqrt(1-a))
-    return R * c
+BASE_DIR = Path(__file__).resolve().parent
+DATASET_PATH = BASE_DIR / "mumbai_cab_fare_train.csv"
+MODEL_PATH = BASE_DIR / "mumbai_cab_fare_model.pkl"
+METRICS_PATH = BASE_DIR / "mumbai_model_metrics.json"
+PLOT_PATH = BASE_DIR / "actual_vs_predicted.png"
+IMPORTANCE_PLOT_PATH = BASE_DIR / "feature_importance.png"
 
-# 2. Key Mumbai Hub Coordinates
+SEED = 42
+
 MUMBAI_HUBS = [
-    (18.9400, 72.8353), # CST Station
-    (18.9438, 72.8234), # Marine Drive
-    (19.0178, 72.8478), # Dadar
-    (19.0657, 72.8687), # BKC
-    (19.0596, 72.8295), # Bandra
-    (19.1197, 72.8464), # Andheri
-    (19.0896, 72.8656), # Mumbai Airport T2
-    (19.1264, 72.9080), # Powai
-    (19.2183, 72.9781), # Thane
-    (19.0771, 72.9986), # Vashi
+    (18.9400, 72.8353),  # CST Station
+    (18.9438, 72.8234),  # Marine Drive
+    (19.0178, 72.8478),  # Dadar
+    (19.0657, 72.8687),  # BKC
+    (19.0596, 72.8295),  # Bandra
+    (19.1197, 72.8464),  # Andheri
+    (19.0896, 72.8656),  # Mumbai Airport T2
+    (19.1264, 72.9080),  # Powai
+    (19.2183, 72.9781),  # Thane
+    (19.0771, 72.9986),  # Vashi
 ]
 
-np.random.seed(42)
-num_samples = 5000
+# Outer-MMR / getaway towns so the model also sees 50-160 km trips.
+DISTANT_HUBS = [
+    (18.6414, 72.8722),  # Alibaug
+    (18.9107, 73.3236),  # Karjat
+    (18.7546, 73.4062),  # Lonavala
+    (18.5204, 73.8567),  # Pune
+    (19.9975, 73.7898),  # Nashik
+    (20.0110, 73.7903),  # Nashik Road
+    (19.2403, 73.1305),  # Kalyan-Badlapur belt
+    (18.4088, 72.8064),  # Murud
+]
 
-data = []
-for _ in range(num_samples):
-    # Select pickup hub and add random noise
-    p_hub = MUMBAI_HUBS[np.random.randint(0, len(MUMBAI_HUBS))]
-    p_lat = p_hub[0] + np.random.uniform(-0.02, 0.02)
-    p_lon = p_hub[1] + np.random.uniform(-0.02, 0.02)
-    
-    # Select dropoff hub
-    d_hub = MUMBAI_HUBS[np.random.randint(0, len(MUMBAI_HUBS))]
-    d_lat = d_hub[0] + np.random.uniform(-0.02, 0.02)
-    d_lon = d_hub[1] + np.random.uniform(-0.02, 0.02)
-    
-    dist_km = haversine(p_lat, p_lon, d_lat, d_lon)
-    if dist_km < 0.5:
-        dist_km = np.random.uniform(1.2, 3.5) # ensure reasonable trip distance
-        
-    passengers = np.random.choice([1, 2, 3, 4], p=[0.6, 0.25, 0.1, 0.05])
-    hour = np.random.randint(0, 24)
-    day_of_week = np.random.randint(0, 7)
-    
-    # Traffic estimation based on hour
-    if 8 <= hour <= 11 or 17 <= hour <= 21:
-        traffic_factor = np.random.uniform(1.3, 1.7) # Peak rush hours
-    elif 22 <= hour or hour <= 5:
-        traffic_factor = np.random.uniform(0.9, 1.1) # Night traffic
-    else:
-        traffic_factor = np.random.uniform(1.0, 1.25)
-        
-    # Duration estimation (in mins) based on distance and traffic
-    avg_speed_kmh = 22 / traffic_factor # Mumbai avg speed ~22 km/h
-    duration_min = (dist_km / avg_speed_kmh) * 60
-    
-    # Weather flag: 0=Sunny, 1=Rainy, 2=Heavy Rain
-    weather_flag = np.random.choice([0, 1, 2], p=[0.75, 0.20, 0.05])
-    weather_mult = 1.0 if weather_flag == 0 else (1.15 if weather_flag == 1 else 1.30)
-    
-    # Night surge multiplier (11 PM - 5 AM)
-    night_mult = 1.25 if (hour >= 23 or hour <= 5) else 1.0
-    
-    # Mumbai Auto / Taxi fare formula base calculation:
-    # Base fare ~ ₹28 for first 1.5 km, ~ ₹18.5/km after
-    if dist_km <= 1.5:
-        base_fare = 28.0
-    else:
-        base_fare = 28.0 + (dist_km - 1.5) * 18.5
-        
-    # Time charge ~ ₹1.5 per minute of trip
-    time_charge = duration_min * 1.5
-    
-    # Total fare calculation with mild random variation
-    fare = (base_fare + time_charge) * traffic_factor * weather_mult * night_mult
-    fare += np.random.normal(0, 5.0) # Add realistic noise
-    fare = max(fare, 28.0) # Minimum fare in Mumbai
-    
-    data.append({
-        'pickup_latitude': round(p_lat, 6),
-        'pickup_longitude': round(p_lon, 6),
-        'dropoff_latitude': round(d_lat, 6),
-        'dropoff_longitude': round(d_lon, 6),
-        'passenger_count': int(passengers),
-        'route_distance_km': round(dist_km, 2),
-        'route_duration_min': round(duration_min, 1),
-        'pickup_hour': int(hour),
-        'day_of_week': int(day_of_week),
-        'weather_flag': int(weather_flag),
-        'fare_amount': round(fare, 2)
-    })
 
-df = pd.DataFrame(data)
+def generate_dataset(n_city_tight: int = 3500, n_city_wide: int = 1500, n_long: int = 2200,
+                     seed: int = SEED, config: dict | None = None) -> pd.DataFrame:
+    """Simulate trips. Distances are ROAD-like (straight line x detour factor),
+    durations include the same traffic multiplier the app applies, and fares come
+    from the same functions the app uses to compare platforms."""
+    rng = np.random.default_rng(seed)
+    config = config or fl.load_config()
 
-# Save Mumbai dataset to CSV
-dataset_path = os.path.join(os.path.dirname(__file__), "mumbai_cab_fare_train.csv")
-df.to_csv(dataset_path, index=False)
-print(f"[SUCCESS] Created Mumbai dataset: {dataset_path} ({len(df)} rows)")
+    plan = (
+        [(MUMBAI_HUBS, MUMBAI_HUBS, 0.02)] * n_city_tight
+        + [(MUMBAI_HUBS, MUMBAI_HUBS, 0.04)] * n_city_wide
+        + [(MUMBAI_HUBS, DISTANT_HUBS, 0.02)] * n_long
+    )
 
-# 3. Model Training
-X = df[['pickup_latitude', 'pickup_longitude', 'dropoff_latitude', 'dropoff_longitude', 
-        'passenger_count', 'route_distance_km', 'route_duration_min', 'pickup_hour', 
-        'day_of_week', 'weather_flag']]
-y = df['fare_amount']
+    def jitter(pool, noise):
+        lat, lon = pool[rng.integers(0, len(pool))]
+        return lat + rng.uniform(-noise, noise), lon + rng.uniform(-noise, noise)
 
-X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+    rows = []
+    for pickup_pool, drop_pool, noise in plan:
+        p_lat, p_lon = jitter(pickup_pool, noise)
+        d_lat, d_lon = jitter(drop_pool, noise)
 
-model = RandomForestRegressor(n_estimators=100, max_depth=15, random_state=42)
-model.fit(X_train, y_train)
+        straight_km = fl.haversine_km(p_lat, p_lon, d_lat, d_lon)
+        road_km = max(straight_km * rng.uniform(1.15, 1.45), 0.6)  # detour factor
 
-# Evaluation
-y_pred = model.predict(X_test)
-mae = mean_absolute_error(y_test, y_pred)
-rmse = np.sqrt(mean_squared_error(y_test, y_pred))
-r2 = r2_score(y_test, y_pred)
+        free_flow_speed = rng.uniform(20, 38) if road_km <= 40 else rng.uniform(40, 65)
+        free_flow_min = road_km / free_flow_speed * 60
 
-print(f"Model Performance on Test Set:")
-print(f"   MAE:  Rs.{mae:.2f}")
-print(f"   RMSE: Rs.{rmse:.2f}")
-print(f"   R2 Score: {r2:.4f}")
+        hour = int(rng.integers(0, 24))
+        weather_flag = int(rng.choice([0, 1, 2], p=[0.75, 0.20, 0.05]))
+        level, traffic_mult = fl.traffic_level(p_lat, p_lon, d_lat, d_lon, hour, weather_flag)
+        duration_min = free_flow_min * traffic_mult
 
-# Save trained model
-model_file = os.path.join(os.path.dirname(__file__), "mumbai_cab_fare_model.pkl")
-joblib.dump(model, model_file)
-print(f"[SUCCESS] Saved trained model to {model_file}")
+        fares = fl.all_platform_fares(config, road_km, duration_min, hour, weather_flag)
+        noisy = {k: v * float(np.clip(rng.normal(1.0, 0.03), 0.9, 1.1)) for k, v in fares.items()}
+        fare = fl.fair_price(noisy)
 
-# Save metrics JSON for reporting
-metrics = {
-    "model_name": "RandomForestRegressor",
-    "dataset_records": len(df),
-    "mae": round(float(mae), 2),
-    "rmse": round(float(rmse), 2),
-    "r2_score": round(float(r2), 4),
-    "target_currency": "INR (₹)",
-    "city": "Mumbai, India"
-}
-metrics_file = os.path.join(os.path.dirname(__file__), "mumbai_model_metrics.json")
-with open(metrics_file, "w") as f:
-    json.dump(metrics, f, indent=4)
+        row = {
+            "pickup_latitude": round(p_lat, 6),
+            "pickup_longitude": round(p_lon, 6),
+            "dropoff_latitude": round(d_lat, 6),
+            "dropoff_longitude": round(d_lon, 6),
+            "route_distance_km": round(road_km, 2),
+            "route_duration_min": round(duration_min, 1),
+            "pickup_hour": hour,
+            "weather_flag": weather_flag,
+            "traffic_level": level,
+            "ola_fare": round(noisy["ola_mini"], 2),
+            "uber_fare": round(noisy["uber_go"], 2),
+            "rapido_fare": round(noisy["rapido_bike_cab"], 2),
+            "kaali_peeli_fare": round(noisy["mumbai_kaali_peeli"], 2),
+            "fare_amount": round(fare, 2),
+            # coarse origin/destination cell, used to keep similar trips in the same CV fold
+            "route_group": f"{round(p_lat / 0.05)}_{round(p_lon / 0.05)}>{round(d_lat / 0.05)}_{round(d_lon / 0.05)}",
+        }
+        rows.append(row)
 
-print("--- Mumbai Model Training Completed Successfully ---")
+    df = pd.DataFrame(rows)
+    df["is_peak"] = df["pickup_hour"].map(lambda h: int(fl.is_peak_hour(int(h))))
+    df["is_night"] = df["pickup_hour"].map(lambda h: int(fl.is_night_hour(int(h))))
+    return df
+
+
+def _scores(y_true, y_pred) -> dict:
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
+    return {
+        "mae": round(float(mean_absolute_error(y_true, y_pred)), 2),
+        "rmse": round(float(np.sqrt(mean_squared_error(y_true, y_pred))), 2),
+        "r2_score": round(float(r2_score(y_true, y_pred)), 4),
+        "mape_pct": round(float(np.mean(np.abs(y_true - y_pred) / y_true) * 100), 2),
+    }
+
+
+def _new_regressor() -> RandomForestRegressor:
+    return RandomForestRegressor(
+        n_estimators=150, max_depth=12, min_samples_leaf=5, n_jobs=-1, random_state=SEED
+    )
+
+
+def _fit_ratio(df_train: pd.DataFrame) -> RandomForestRegressor:
+    ratio = df_train["fare_amount"] / fl.baseline_fare(
+        df_train["route_distance_km"], df_train["route_duration_min"])
+    reg = _new_regressor()
+    reg.fit(df_train[fl.FEATURES], ratio)
+    return reg
+
+
+def main() -> None:
+    print("--- Mumbai cab fare: dataset generation + model training (SIMULATED data) ---")
+    df = generate_dataset()
+    df.to_csv(DATASET_PATH, index=False)
+    print(f"[OK] dataset: {DATASET_PATH.name} ({len(df)} rows)")
+
+    # ---- Held-out evaluation, grouped by origin/destination cell -----------
+    splitter = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=SEED)
+    train_idx, test_idx = next(splitter.split(df, groups=df["route_group"]))
+    df_train, df_test = df.iloc[train_idx], df.iloc[test_idx]
+
+    holdout_model = fl.FareModel(_fit_ratio(df_train))
+    y_test = df_test["fare_amount"].to_numpy()
+    y_pred = holdout_model.predict_frame(df_test)
+    holdout = _scores(y_test, y_pred)
+
+    lin = LinearRegression().fit(df_train[["route_distance_km", "route_duration_min"]], df_train["fare_amount"])
+    lin_pred = lin.predict(df_test[["route_distance_km", "route_duration_min"]])
+    linear_baseline = _scores(y_test, lin_pred)
+
+    bands = {}
+    for lo, hi in [(0, 10), (10, 20), (20, 40), (40, 1000)]:
+        mask = (df_test["route_distance_km"] >= lo) & (df_test["route_distance_km"] < hi)
+        if mask.any():
+            bands[f"{lo}-{hi if hi < 1000 else '+'}km"] = _scores(y_test[mask.to_numpy()], y_pred[mask.to_numpy()])
+
+    # ---- 5-fold grouped cross-validation -----------------------------------
+    cv_mae = []
+    for tr, te in GroupKFold(n_splits=5).split(df, groups=df["route_group"]):
+        m = fl.FareModel(_fit_ratio(df.iloc[tr]))
+        cv_mae.append(mean_absolute_error(df.iloc[te]["fare_amount"], m.predict_frame(df.iloc[te])))
+
+    print("\n========== HELD-OUT PERFORMANCE (unseen route cells) ==========")
+    print(f"MAE  : Rs {holdout['mae']:.2f}   RMSE: Rs {holdout['rmse']:.2f}   "
+          f"R2: {holdout['r2_score']:.4f}   MAPE: {holdout['mape_pct']:.2f}%")
+    print(f"Linear(dist,dur) baseline MAE: Rs {linear_baseline['mae']:.2f}  R2: {linear_baseline['r2_score']:.4f}")
+    print(f"5-fold grouped CV MAE: Rs {np.mean(cv_mae):.2f} +/- {np.std(cv_mae):.2f}")
+
+    # ---- Plots -------------------------------------------------------------
+    fig, ax = plt.subplots(figsize=(7, 7))
+    ax.scatter(y_test, y_pred, alpha=0.4, s=12)
+    lim = [0, max(y_test.max(), y_pred.max())]
+    ax.plot(lim, lim, "r--", linewidth=2)
+    ax.set_title(f"Actual vs Predicted fare - held-out routes (R2 = {holdout['r2_score']:.4f})")
+    ax.set_xlabel("Actual simulated fare (Rs)")
+    ax.set_ylabel("Predicted fare (Rs)")
+    ax.grid(alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(PLOT_PATH, dpi=150)
+    plt.close(fig)
+
+    # ---- Final model: refit on all rows (metrics above are from the held-out split)
+    final_reg = _fit_ratio(df)
+    importances = dict(zip(fl.FEATURES, (round(float(v), 4) for v in final_reg.feature_importances_)))
+
+    fig, ax = plt.subplots(figsize=(7, 4))
+    order = sorted(importances, key=importances.get)
+    ax.barh(order, [importances[k] for k in order])
+    ax.set_title("Random Forest feature importance (fare / baseline ratio)")
+    ax.grid(alpha=0.3, axis="x")
+    fig.tight_layout()
+    fig.savefig(IMPORTANCE_PLOT_PATH, dpi=150)
+    plt.close(fig)
+
+    metrics = {
+        "model_name": "Random Forest Regressor (predicts fare / baseline ratio)",
+        "data_source": "simulated",
+        "dataset_records": int(len(df)),
+        "evaluation": "20% held-out split grouped by origin/destination cell (unseen route cells)",
+        "n_estimators": final_reg.n_estimators,
+        "max_depth": final_reg.max_depth,
+        "min_samples_leaf": final_reg.min_samples_leaf,
+        "features": fl.FEATURES,
+        "mae": holdout["mae"],
+        "rmse": holdout["rmse"],
+        "r2_score": holdout["r2_score"],
+        "mape_pct": holdout["mape_pct"],
+        "cv_mae_mean": round(float(np.mean(cv_mae)), 2),
+        "cv_mae_std": round(float(np.std(cv_mae)), 2),
+        "linear_baseline": linear_baseline,
+        "mae_by_distance_band": bands,
+        "feature_importance": importances,
+        "city": "Mumbai",
+        "currency": "INR",
+        "sklearn_version": sklearn.__version__,
+        "trained_on": date.today().isoformat(),
+    }
+    with open(METRICS_PATH, "w", encoding="utf-8") as fh:
+        json.dump(metrics, fh, indent=4)
+
+    final_model = fl.FareModel(final_reg, meta={"sklearn_version": sklearn.__version__})
+    joblib.dump(final_model, MODEL_PATH, compress=3)
+    print(f"\n[OK] model saved: {MODEL_PATH.name} ({MODEL_PATH.stat().st_size / 1e6:.1f} MB)")
+    print("[OK] metrics + plots written")
+
+
+if __name__ == "__main__":
+    sys.exit(main())

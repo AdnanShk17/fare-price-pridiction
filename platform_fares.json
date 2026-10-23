@@ -1,49 +1,86 @@
 {
-    "disclaimer": "Academic estimated comparison bands for Mumbai cab platforms. No live scraping or paid API used.",
+    "disclaimer": "Academic estimated comparison bands for Mumbai cab platforms. These are NOT official or live prices: no scraping and no paid API is used. Edit the numbers below to tune the simulation.",
     "platforms": {
         "ola_mini": {
             "name": "Ola Mini / Go",
             "icon": "🟡",
             "base_fare": 35.0,
+            "free_km": 0.0,
             "per_km_rate": 18.0,
             "per_min_rate": 1.8,
             "minimum_fare": 50.0,
             "surge_peak_multiplier": 1.25,
-            "rain_multiplier": 1.20,
-            "description": "Popular hatchback cab service for quick daily commutes across Mumbai."
+            "surge_night_multiplier": 1.1,
+            "rain_multiplier": 1.2,
+            "heavy_rain_multiplier": 1.35,
+            "description": "Popular hatchback cab service for quick daily commutes across Mumbai.",
+            "vehicle_multipliers": {
+                "Auto Rickshaw": 0.85,
+                "Kaali-Peeli Taxi": 0.95,
+                "Hatchback / Sedan": 1.0,
+                "SUV Prime": 1.45
+            }
         },
         "uber_go": {
             "name": "Uber Go",
             "icon": "⬛",
             "base_fare": 38.0,
+            "free_km": 0.0,
             "per_km_rate": 19.5,
             "per_min_rate": 2.0,
             "minimum_fare": 55.0,
-            "surge_peak_multiplier": 1.30,
+            "surge_peak_multiplier": 1.3,
+            "surge_night_multiplier": 1.1,
             "rain_multiplier": 1.25,
-            "description": "Standard air-conditioned hatchback and compact sedan rides."
+            "heavy_rain_multiplier": 1.4,
+            "description": "Standard air-conditioned hatchback and compact sedan rides.",
+            "vehicle_multipliers": {
+                "Auto Rickshaw": 0.85,
+                "Kaali-Peeli Taxi": 0.95,
+                "Hatchback / Sedan": 1.0,
+                "SUV Prime": 1.5
+            }
         },
         "rapido_bike_cab": {
             "name": "Rapido Bike / Auto",
             "icon": "🛵",
             "base_fare": 20.0,
+            "free_km": 0.0,
             "per_km_rate": 12.0,
             "per_min_rate": 1.0,
             "minimum_fare": 25.0,
             "surge_peak_multiplier": 1.15,
+            "surge_night_multiplier": 1.1,
             "rain_multiplier": 1.15,
-            "description": "Affordable first-mile / last-mile bike taxi and auto rickshaw option."
+            "heavy_rain_multiplier": 1.25,
+            "description": "Affordable first-mile / last-mile bike taxi and auto rickshaw option.",
+            "vehicle_multipliers": {
+                "Auto Rickshaw": 1.0,
+                "Kaali-Peeli Taxi": null,
+                "Hatchback / Sedan": 1.6,
+                "SUV Prime": null
+            }
         },
         "mumbai_kaali_peeli": {
             "name": "Mumbai Kaali-Peeli Taxi",
             "icon": "🚕",
             "base_fare": 28.0,
+            "free_km": 1.5,
             "per_km_rate": 18.66,
             "per_min_rate": 0.0,
             "minimum_fare": 28.0,
             "surge_peak_multiplier": 1.0,
+            "surge_night_multiplier": 1.25,
             "rain_multiplier": 1.0,
-            "description": "Official RTO regulated non-AC black and yellow taxi meter rate."
+            "heavy_rain_multiplier": 1.0,
+            "description": "Meter-regulated black and yellow taxi (no surge or rain pricing). VERIFY the tariff and the night-surcharge window against the current transport-authority notification before quoting it.",
+            "vehicle_multipliers": {
+                "Auto Rickshaw": null,
+                "Kaali-Peeli Taxi": 1.0,
+                "Hatchback / Sedan": 1.0,
+                "SUV Prime": null
+            }
         }
-    }
+    },
+    "vehicle_note": "vehicle_multipliers scale each platform's fare for the selected vehicle category (1.0 = the platform's base rates). null means the platform does not offer that category. These are academic assumptions - edit them to tune the simulation."
 }
